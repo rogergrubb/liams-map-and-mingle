@@ -1,0 +1,1388 @@
+import { Hono } from 'hono';
+import { prisma, broadcastToAll } from '../index';
+import { checkUsageLimit } from '../middleware/usageLimits';
+import { z } from 'zod';
+import { notifyAboutNewPin, notifyAboutPinLike } from '../services/notificationService';
+
+// Pin lifecycle status
+type PinStatus = 'active' | 'recently_arrived' | 'ghost' | 'old_ghost';
+
+// Calculate pin status based on age and type
+// Pins last 30 days with very gradual opacity decay
+function calculatePinStatus(pin: { 
+  pinType: string; 
+  arrivalTime: Date | null; 
+  createdAt: Date;
+}): { status: PinStatus; opacity: number; ageHours: number } {
+  const now = new Date();
+  
+  // Future pin with countdown
+  if (pin.pinType === 'future' && pin.arrivalTime) {
+    const arrival = new Date(pin.arrivalTime);
+    
+    // Before arrival - active with full opacity
+    if (arrival > now) {
+      return { status: 'active', opacity: 1.0, ageHours: 0 };
+    }
+    
+    // After arrival - calculate time since arrival
+    const hoursSinceArrival = (now.getTime() - arrival.getTime()) / (1000 * 60 * 60);
+    const daysSinceArrival = hoursSinceArrival / 24;
+    
+    // Full opacity for first 3 days after arrival
+    if (daysSinceArrival < 3) {
+      return { status: 'recently_arrived', opacity: 1.0, ageHours: hoursSinceArrival };
+    }
+    
+    // Days 3-7: opacity 0.9
+    if (daysSinceArrival < 7) {
+      return { status: 'ghost', opacity: 0.9, ageHours: hoursSinceArrival };
+    }
+    
+    // Days 7-14: opacity 0.8
+    if (daysSinceArrival < 14) {
+      return { status: 'ghost', opacity: 0.8, ageHours: hoursSinceArrival };
+    }
+    
+    // Days 14-21: opacity 0.7
+    if (daysSinceArrival < 21) {
+      return { status: 'old_ghost', opacity: 0.7, ageHours: hoursSinceArrival };
+    }
+    
+    // Days 21-30: opacity 0.6
+    if (daysSinceArrival < 30) {
+      return { status: 'old_ghost', opacity: 0.6, ageHours: hoursSinceArrival };
+    }
+    
+    // 30+ days - minimum opacity before cleanup
+    return { status: 'old_ghost', opacity: 0.5, ageHours: hoursSinceArrival };
+  }
+  
+  // Current location pin - based on creation time
+  const hoursSinceCreated = (now.getTime() - pin.createdAt.getTime()) / (1000 * 60 * 60);
+  const daysSinceCreated = hoursSinceCreated / 24;
+  
+  // Full opacity for first 3 days
+  if (daysSinceCreated < 3) {
+    return { status: 'active', opacity: 1.0, ageHours: hoursSinceCreated };
+  }
+  
+  // Days 3-7: opacity 0.9
+  if (daysSinceCreated < 7) {
+    return { status: 'active', opacity: 0.9, ageHours: hoursSinceCreated };
+  }
+  
+  // Days 7-14: opacity 0.8
+  if (daysSinceCreated < 14) {
+    return { status: 'ghost', opacity: 0.8, ageHours: hoursSinceCreated };
+  }
+  
+  // Days 14-21: opacity 0.7
+  if (daysSinceCreated < 21) {
+    return { status: 'ghost', opacity: 0.7, ageHours: hoursSinceCreated };
+  }
+  
+  // Days 21-30: opacity 0.6
+  if (daysSinceCreated < 30) {
+    return { status: 'old_ghost', opacity: 0.6, ageHours: hoursSinceCreated };
+  }
+  
+  // 30+ days old - minimum opacity
+  return { status: 'old_ghost', opacity: 0.5, ageHours: hoursSinceCreated };
+}
+
+// Check if pin should be auto-deleted (30+ days old)
+function shouldDeletePin(pin: { 
+  pinType: string; 
+  arrivalTime: Date | null; 
+  createdAt: Date;
+}): boolean {
+  const now = new Date();
+  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+  
+  if (pin.pinType === 'future' && pin.arrivalTime) {
+    const arrival = new Date(pin.arrivalTime);
+    return (now.getTime() - arrival.getTime()) > thirtyDaysMs;
+  }
+  
+  return (now.getTime() - pin.createdAt.getTime()) > thirtyDaysMs;
+}
+
+
+// Helper to extract userId from JWT token
+function extractUserIdFromToken(authHeader: string | undefined): string | undefined {
+  if (!authHeader) return undefined;
+  
+  const token = authHeader.replace('Bearer ', '');
+  if (!token) return undefined;
+  
+  try {
+    const JWT = require('jsonwebtoken');
+    const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+    const decoded = JWT.verify(token, JWT_SECRET) as any;
+    return decoded.userId || undefined;
+  } catch (error) {
+    console.error('JWT verification failed:', error);
+    return undefined;
+  }
+}
+
+export const pinRoutes = new Hono();
+
+// Validation schemas
+const createPinSchema = z.object({
+  latitude: z.number(),
+  longitude: z.number(),
+  description: z.string().min(1).max(500),
+  image: z.string().optional(),
+});
+
+const getPinsSchema = z.object({
+  north: z.coerce.number(),
+  south: z.coerce.number(),
+  east: z.coerce.number(),
+  west: z.coerce.number(),
+  filter: z.enum(['all', '24h', 'week']).optional(),
+  lookingFor: z.string().optional(), // Filter by connection type: dating, friends, networking, events, travel
+});
+
+// Helper: Check if viewer can see a pin based on selective visibility
+async function canViewPin(pin: any, viewerId: string | null): Promise<boolean> {
+  // If no viewer (anonymous), they can see public pins only
+  if (!viewerId) return true;
+  
+  // ALWAYS show user's own pins to themselves
+  if (pin.userId === viewerId) return true;
+  
+  // Get pin creator's profile
+  const creatorProfile = await prisma.profile.findUnique({
+    where: { userId: pin.userId },
+  });
+  
+  if (!creatorProfile) return true;
+  
+  // Check ghost mode (doesn't apply to own pins - handled above)
+  if (creatorProfile.ghostMode) return false;
+  
+  // Check selective visibility
+  if (!creatorProfile.selectiveVisibilityEnabled) return true;
+  
+  // Get viewer's profile
+  const viewerProfile = await prisma.profile.findUnique({
+    where: { userId: viewerId },
+  });
+  
+  if (!viewerProfile) return false;
+  
+  // Check if blocked
+  if (creatorProfile.visibilityHideFromBlocked) {
+    const isBlocked = await prisma.block.findFirst({
+      where: {
+        OR: [
+          { blockerId: pin.userId, blockedUserId: viewerId },
+          { blockerId: viewerId, blockedUserId: pin.userId },
+        ],
+      },
+    });
+    if (isBlocked) return false;
+  }
+  
+  // Check age range
+  if (creatorProfile.visibilityMinAge && viewerProfile.age) {
+    if (viewerProfile.age < creatorProfile.visibilityMinAge) return false;
+  }
+  if (creatorProfile.visibilityMaxAge && viewerProfile.age) {
+    if (viewerProfile.age > creatorProfile.visibilityMaxAge) return false;
+  }
+  
+  // Check shared interests
+  if (creatorProfile.visibilityRequireInterests && creatorProfile.visibilityMinSharedInterests) {
+    const creatorInterests = JSON.parse(creatorProfile.interests || '[]');
+    const viewerInterests = JSON.parse(viewerProfile.interests || '[]');
+    const sharedCount = creatorInterests.filter((i: string) => viewerInterests.includes(i)).length;
+    if (sharedCount < creatorProfile.visibilityMinSharedInterests) return false;
+  }
+  
+  // Check reputation
+  if (creatorProfile.visibilityMinReputation && viewerProfile.trustScore < creatorProfile.visibilityMinReputation) {
+    return false;
+  }
+  
+  // Check premium only
+  if (creatorProfile.visibilityPremiumOnly) {
+    if (viewerProfile.subscriptionStatus !== 'active' && viewerProfile.subscriptionStatus !== 'trial') {
+      return false;
+    }
+  }
+  
+  return true;
+}
+
+// GET /api/pins - Get pins in viewport bounds (shows all pins visible in current map view)
+pinRoutes.get('/', async (c) => {
+  try {
+    const query = c.req.query();
+    const parsed = getPinsSchema.safeParse(query);
+    
+    if (!parsed.success) {
+      return c.json({ error: 'Invalid parameters', details: parsed.error.errors }, 400);
+    }
+    
+    const { north, south, east, west, filter, lookingFor } = parsed.data;
+    const zoom = parseFloat(query.zoom || '13');
+    
+    // Build date filter
+    let dateFilter = {};
+    if (filter === '24h') {
+      dateFilter = { createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } };
+    } else if (filter === 'week') {
+      dateFilter = { createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } };
+    }
+    
+    // Determine pin limit based on zoom level
+    // At world view (zoom <= 5), fetch more pins for clustering
+    // Higher zoom = fewer pins needed (they're spread out)
+    let pinLimit = 100;
+    if (zoom <= 3) {
+      pinLimit = 2000; // World view - get many pins for clustering
+    } else if (zoom <= 5) {
+      pinLimit = 1000; // Continental view
+    } else if (zoom <= 8) {
+      pinLimit = 500; // Country view
+    } else if (zoom <= 11) {
+      pinLimit = 250; // Regional view
+    }
+    
+    // At very low zoom (world view), don't filter by bounds - get all pins
+    const boundsFilter = zoom <= 5 ? {} : {
+      latitude: { gte: south, lte: north },
+      longitude: { gte: west, lte: east },
+    };
+    
+    const pins = await prisma.pin.findMany({
+      where: {
+        ...boundsFilter,
+        ...dateFilter,
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            image: true,
+            profile: {
+              select: { 
+                avatar: true,
+                lookingFor: true,
+                displayName: true,
+                lastActiveAt: true, // For ghost pin opacity
+              },
+            },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: pinLimit,
+    });
+    
+    // Get viewer ID from header
+    const viewerId = c.req.header('X-User-Id') || null;
+    
+    // Get viewer's connections if logged in
+    let viewerConnections: Map<string, { status: string; connectionId: string; isRequester: boolean }> = new Map();
+    if (viewerId) {
+      const connections = await prisma.connection.findMany({
+        where: {
+          OR: [
+            { requesterId: viewerId },
+            { addresseeId: viewerId },
+          ],
+        },
+        select: {
+          id: true,
+          requesterId: true,
+          addresseeId: true,
+          status: true,
+        },
+      });
+      
+      for (const conn of connections) {
+        const otherUserId = conn.requesterId === viewerId ? conn.addresseeId : conn.requesterId;
+        viewerConnections.set(otherUserId, {
+          status: conn.status,
+          connectionId: conn.id,
+          isRequester: conn.requesterId === viewerId,
+        });
+      }
+    }
+    
+    // Filter based on visibility rules and lookingFor filter
+    const visiblePins = [];
+    const now = Date.now();
+    const oneDayMs = 24 * 60 * 60 * 1000;
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+    
+    for (const pin of pins) {
+      // Skip pins that are 7+ days old (should be auto-deleted)
+      if (shouldDeletePin({ 
+        pinType: pin.pinType || 'current', 
+        arrivalTime: pin.arrivalTime, 
+        createdAt: pin.createdAt 
+      })) {
+        continue; // Skip expired pins
+      }
+      
+      // Check if user has been active within 30 days
+      const lastActive = pin.user.profile?.lastActiveAt;
+      if (lastActive) {
+        const timeSinceActive = now - new Date(lastActive).getTime();
+        if (timeSinceActive > thirtyDaysMs) {
+          continue; // Skip pins from users inactive for 30+ days
+        }
+      }
+      
+      // Check lookingFor filter if specified (skip 'everybody' mode)
+      if (lookingFor && lookingFor !== 'everybody') {
+        const userLookingFor = pin.user.profile?.lookingFor;
+        if (userLookingFor) {
+          try {
+            const lookingForArray = JSON.parse(userLookingFor);
+            if (!lookingForArray.includes(lookingFor)) {
+              continue; // Skip this pin - user not looking for this type
+            }
+          } catch {
+            continue; // Skip if can't parse
+          }
+        } else {
+          continue; // Skip if no lookingFor set
+        }
+      }
+      
+      if (await canViewPin(pin, viewerId)) {
+        // Calculate if user is "active" (within 24h) or "ghost" (1-30 days)
+        const lastActiveTime = pin.user.profile?.lastActiveAt 
+          ? new Date(pin.user.profile.lastActiveAt).getTime() 
+          : new Date(pin.createdAt).getTime();
+        const timeSinceActive = now - lastActiveTime;
+        const isActive = timeSinceActive < oneDayMs;
+        
+        // Calculate pin lifecycle status and opacity
+        const pinLifecycle = calculatePinStatus({
+          pinType: pin.pinType || 'current',
+          arrivalTime: pin.arrivalTime,
+          createdAt: pin.createdAt,
+        });
+        
+        // Get connection status for this pin's creator
+        const connectionInfo = viewerConnections.get(pin.user.id);
+        const isFriend = connectionInfo?.status === 'accepted';
+        
+        visiblePins.push({
+          id: pin.id,
+          latitude: pin.latitude,
+          longitude: pin.longitude,
+          description: pin.description,
+          image: pin.image,
+          likesCount: pin.likesCount,
+          createdAt: pin.createdAt.toISOString(),
+          updatedAt: pin.updatedAt.toISOString(),
+          arrivalTime: pin.arrivalTime?.toISOString() || null, // When user will arrive
+          pinType: pin.pinType || 'current', // "current" or "future"
+          isActive, // true if logged in within 24h
+          lastActiveAt: pin.user.profile?.lastActiveAt?.toISOString() || pin.createdAt.toISOString(),
+          isFriend, // true if connected
+          connectionStatus: connectionInfo?.status || 'none',
+          connectionId: connectionInfo?.connectionId || null,
+          isRequester: connectionInfo?.isRequester || false,
+          // Pin lifecycle status
+          pinStatus: pinLifecycle.status,
+          pinOpacity: pinLifecycle.opacity,
+          pinAgeHours: pinLifecycle.ageHours,
+          createdBy: {
+            id: pin.user.id,
+            name: pin.user.profile?.displayName || pin.user.name,
+            image: pin.user.image,
+            avatar: pin.user.profile?.avatar,
+          },
+        });
+      }
+    }
+    
+    return c.json(visiblePins);
+  } catch (error) {
+    console.error('Error fetching pins:', error);
+    return c.json({ error: 'Failed to fetch pins' }, 500);
+  }
+});
+
+// GET /api/pins/nearby - Get pins within radius for auto-zoom algorithm
+// Returns counts at different radii to help frontend determine optimal zoom
+pinRoutes.get('/nearby', async (c) => {
+  try {
+    const lat = parseFloat(c.req.query('lat') || '0');
+    const lng = parseFloat(c.req.query('lng') || '0');
+    
+    if (!lat || !lng) {
+      return c.json({ error: 'lat and lng required' }, 400);
+    }
+    
+    // Define search radii in km (2km, 5km, 10km, 25km)
+    const radii = [2, 5, 10, 25];
+    const now = Date.now();
+    const oneDayMs = 24 * 60 * 60 * 1000;
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+    
+    // Helper to calculate distance in km using Haversine formula
+    const haversineDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
+      const R = 6371; // Earth's radius in km
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                Math.sin(dLon/2) * Math.sin(dLon/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c;
+    };
+    
+    // Get all pins within the largest radius (25km ≈ 0.25 degrees)
+    const maxRadiusDegrees = 0.3; // Slightly larger than 25km to be safe
+    const pins = await prisma.pin.findMany({
+      where: {
+        latitude: { gte: lat - maxRadiusDegrees, lte: lat + maxRadiusDegrees },
+        longitude: { gte: lng - maxRadiusDegrees, lte: lng + maxRadiusDegrees },
+      },
+      include: {
+        user: {
+          select: {
+            profile: {
+              select: { lastActiveAt: true, ghostMode: true },
+            },
+          },
+        },
+      },
+    });
+    
+    // Calculate counts for each radius
+    const radiusCounts = radii.map(radius => {
+      let liveNow = 0;      // Active within 24h
+      let activeToday = 0;  // Active within 24h (same as liveNow for now)
+      let activeWeek = 0;   // Active within 7 days
+      let total = 0;        // Active within 30 days
+      
+      pins.forEach(pin => {
+        // Skip ghost mode users
+        if (pin.user.profile?.ghostMode) return;
+        
+        const distance = haversineDistance(lat, lng, pin.latitude, pin.longitude);
+        if (distance > radius) return;
+        
+        const lastActive = pin.user.profile?.lastActiveAt 
+          ? new Date(pin.user.profile.lastActiveAt).getTime()
+          : new Date(pin.createdAt).getTime();
+        const timeSince = now - lastActive;
+        
+        if (timeSince > thirtyDaysMs) return; // Skip 30+ day old pins
+        
+        total++;
+        if (timeSince <= sevenDaysMs) activeWeek++;
+        if (timeSince <= oneDayMs) {
+          liveNow++;
+          activeToday++;
+        }
+      });
+      
+      return { radius, liveNow, activeToday, activeWeek, total };
+    });
+    
+    // Find optimal radius (smallest with at least 5 pins)
+    const minClusterSize = 5;
+    let optimalRadius = radii[radii.length - 1]; // Default to largest
+    let optimalZoom = 11; // Default zoom for 25km
+    
+    // Radius to zoom level mapping
+    const radiusToZoom: Record<number, number> = {
+      2: 15,   // ~2km view
+      5: 14,   // ~5km view
+      10: 13,  // ~10km view
+      25: 11,  // ~25km view
+    };
+    
+    for (const rc of radiusCounts) {
+      if (rc.total >= minClusterSize) {
+        optimalRadius = rc.radius;
+        optimalZoom = radiusToZoom[rc.radius];
+        break;
+      }
+    }
+    
+    // Get the counts for the optimal radius
+    const optimal = radiusCounts.find(r => r.radius === optimalRadius) || radiusCounts[radiusCounts.length - 1];
+    
+    return c.json({
+      radiusCounts,
+      optimal: {
+        radius: optimalRadius,
+        zoom: optimalZoom,
+        liveNow: optimal.liveNow,
+        activeToday: optimal.activeToday,
+        activeWeek: optimal.activeWeek,
+        total: optimal.total,
+      },
+      isEmpty: optimal.total === 0,
+    });
+  } catch (error) {
+    console.error('Error fetching nearby pins:', error);
+    return c.json({ error: 'Failed to fetch nearby pins' }, 500);
+  }
+});
+
+// GET /api/pins/global-stats - Get worldwide mingler statistics
+pinRoutes.get('/global-stats', async (c) => {
+  try {
+    const now = new Date();
+    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    
+    // Count users with pins updated in last 24 hours (live now)
+    const liveNow = await prisma.pin.count({
+      where: {
+        createdAt: { gte: oneDayAgo },
+        user: {
+          profile: {
+            ghostMode: false, // Don't count ghost mode users
+          },
+        },
+      },
+    });
+    
+    // Count unique users with pins in last 30 days (active this month)
+    const activeUsersThisMonth = await prisma.pin.groupBy({
+      by: ['userId'],
+      where: {
+        createdAt: { gte: thirtyDaysAgo },
+        user: {
+          profile: {
+            ghostMode: false,
+          },
+        },
+      },
+    });
+    
+    return c.json({
+      liveNow,
+      activeThisMonth: activeUsersThisMonth.length,
+    });
+  } catch (error) {
+    console.error('Error fetching global stats:', error);
+    return c.json({ liveNow: 0, activeThisMonth: 0 });
+  }
+});
+
+// GET /api/pins/incoming - Get people coming to an area (future pins)
+// This shows travelers/visitors arriving in the viewer's area soon
+pinRoutes.get('/incoming', async (c) => {
+  try {
+    const query = c.req.query();
+    const north = parseFloat(query.north || '90');
+    const south = parseFloat(query.south || '-90');
+    const east = parseFloat(query.east || '180');
+    const west = parseFloat(query.west || '-180');
+    const days = parseInt(query.days || '7'); // Default: show arrivals in next 7 days
+    
+    const now = new Date();
+    const futureDate = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+    
+    // Find future pins in this area arriving within the timeframe
+    const incomingPins = await prisma.pin.findMany({
+      where: {
+        pinType: 'future',
+        arrivalTime: {
+          gte: now, // Not yet arrived
+          lte: futureDate, // Within the requested timeframe
+        },
+        latitude: { gte: south, lte: north },
+        longitude: { gte: west, lte: east },
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            image: true,
+            bio: true,
+            interests: true,
+            profile: {
+              select: {
+                avatar: true,
+                displayName: true,
+                bio: true,
+                lookingFor: true,
+                location: true,
+              },
+            },
+          },
+        },
+      },
+      orderBy: { arrivalTime: 'asc' }, // Soonest arrivals first
+      take: 50,
+    });
+    
+    // Get viewer's connections to show relationship status
+    const viewerId = c.req.header('X-User-Id') || null;
+    let viewerConnections = new Map<string, string>();
+    
+    if (viewerId) {
+      const connections = await prisma.connection.findMany({
+        where: {
+          OR: [
+            { requesterId: viewerId },
+            { addresseeId: viewerId },
+          ],
+          status: 'accepted',
+        },
+        select: {
+          requesterId: true,
+          addresseeId: true,
+        },
+      });
+      
+      for (const conn of connections) {
+        const otherId = conn.requesterId === viewerId ? conn.addresseeId : conn.requesterId;
+        viewerConnections.set(otherId, 'connected');
+      }
+    }
+    
+    // Format response with arrival countdown and user details
+    const visitors = incomingPins.map(pin => {
+      const arrivalTime = new Date(pin.arrivalTime!);
+      const hoursUntilArrival = Math.max(0, (arrivalTime.getTime() - now.getTime()) / (1000 * 60 * 60));
+      const daysUntilArrival = Math.floor(hoursUntilArrival / 24);
+      const remainingHours = Math.floor(hoursUntilArrival % 24);
+      
+      // Determine urgency level for UI styling
+      let urgency: 'imminent' | 'soon' | 'upcoming' | 'later' = 'later';
+      if (hoursUntilArrival <= 2) urgency = 'imminent';
+      else if (hoursUntilArrival <= 24) urgency = 'soon';
+      else if (daysUntilArrival <= 2) urgency = 'upcoming';
+      
+      return {
+        id: pin.id,
+        userId: pin.userId,
+        latitude: pin.latitude,
+        longitude: pin.longitude,
+        description: pin.description,
+        arrivalTime: arrivalTime.toISOString(),
+        countdown: {
+          days: daysUntilArrival,
+          hours: remainingHours,
+          totalHours: Math.round(hoursUntilArrival),
+          urgency,
+          label: daysUntilArrival > 0 
+            ? `${daysUntilArrival}d ${remainingHours}h`
+            : `${remainingHours}h`,
+        },
+        user: {
+          id: pin.user.id,
+          name: pin.user.profile?.displayName || pin.user.name || 'Anonymous',
+          avatar: pin.user.profile?.avatar || pin.user.image,
+          bio: pin.user.profile?.bio || pin.user.bio,
+          interests: pin.user.interests || [],
+          lookingFor: pin.user.profile?.lookingFor || [],
+          location: pin.user.profile?.location || null,
+          isConnected: viewerConnections.has(pin.userId),
+        },
+      };
+    });
+    
+    // Group by timeframe for easier UI rendering
+    const grouped = {
+      today: visitors.filter(v => v.countdown.totalHours <= 24),
+      tomorrow: visitors.filter(v => v.countdown.totalHours > 24 && v.countdown.totalHours <= 48),
+      thisWeek: visitors.filter(v => v.countdown.totalHours > 48),
+    };
+    
+    return c.json({
+      total: visitors.length,
+      visitors,
+      grouped,
+      viewArea: { north, south, east, west },
+    });
+  } catch (error) {
+    console.error('Error fetching incoming visitors:', error);
+    return c.json({ error: 'Failed to fetch incoming visitors' }, 500);
+  }
+});
+
+pinRoutes.get('/mine', async (c) => {
+  try {
+    let userId = c.req.header('X-User-Id');
+    if (!userId) {
+      const authHeader = c.req.header('Authorization');
+      userId = extractUserIdFromToken(authHeader);
+    }
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    
+    const pins = await prisma.pin.findMany({
+      where: { userId },
+      orderBy: [
+        { pinType: 'asc' }, // 'current' comes before 'future'
+        { arrivalTime: 'asc' }, // Sort future pins by arrival time
+      ],
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            profile: {
+              select: {
+                avatar: true,
+                displayName: true,
+              },
+            },
+          },
+        },
+      },
+    });
+    
+    const formattedPins = pins.map(pin => {
+      const lifecycle = calculatePinStatus({
+        pinType: pin.pinType || 'current',
+        arrivalTime: pin.arrivalTime,
+        createdAt: pin.createdAt,
+      });
+      
+      return {
+        id: pin.id,
+        latitude: pin.latitude,
+        longitude: pin.longitude,
+        description: pin.description,
+        pinType: pin.pinType || 'current',
+        arrivalTime: pin.arrivalTime?.toISOString() || null,
+        createdAt: pin.createdAt.toISOString(),
+        pinStatus: lifecycle.status,
+        pinOpacity: lifecycle.opacity,
+        ageHours: lifecycle.ageHours,
+      };
+    });
+    
+    return c.json({ pins: formattedPins });
+  } catch (error) {
+    console.error('Error fetching user pins:', error);
+    return c.json({ error: 'Failed to fetch your pins' }, 500);
+  }
+});
+
+// POST /api/pins/auto-create - Auto-create a pin at user's current location
+pinRoutes.post('/auto-create', checkUsageLimit('pin'), async (c) => {
+  try {
+    let userId = c.req.header('X-User-Id');
+    if (!userId) {
+      const authHeader = c.req.header('Authorization');
+      userId = extractUserIdFromToken(authHeader);
+    }
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    
+    const { latitude, longitude, arrivalTime, pinType } = await c.req.json();
+    
+    if (latitude === undefined || longitude === undefined) {
+      return c.json({ error: 'latitude and longitude required' }, 400);
+    }
+    
+    const isPinTypeFuture = pinType === 'future';
+    
+    let pin;
+    let isUpdate = false;
+    
+    if (isPinTypeFuture) {
+      // For future pins, always create a new one (users can have multiple future pins)
+      // But limit to max 2 future pins per user
+      const futureCount = await prisma.pin.count({
+        where: { userId, pinType: 'future' }
+      });
+      
+      if (futureCount >= 5) {
+        return c.json({ error: 'Maximum 5 future pins allowed. Delete an existing one first.' }, 400);
+      }
+      
+      pin = await prisma.pin.create({
+        data: {
+          userId,
+          latitude,
+          longitude,
+          description: 'Heading here!',
+          arrivalTime: arrivalTime ? new Date(arrivalTime) : null,
+          pinType: 'future',
+        },
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              image: true,
+              profile: {
+                select: { avatar: true },
+              },
+            },
+          },
+        },
+      });
+      
+      // Update user's pin count
+      await prisma.profile.update({
+        where: { userId },
+        data: { pinsCreated: { increment: 1 } },
+      });
+    } else {
+      // For current location pins, only allow one - update if exists
+      const existingPin = await prisma.pin.findFirst({
+        where: { userId, pinType: 'current' },
+      });
+    
+    if (existingPin) {
+      // Update existing pin's location
+      pin = await prisma.pin.update({
+        where: { id: existingPin.id },
+        data: {
+          latitude,
+          longitude,
+          arrivalTime: arrivalTime ? new Date(arrivalTime) : null,
+          pinType: pinType || 'current',
+        },
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              image: true,
+              profile: {
+                select: { avatar: true },
+              },
+            },
+          },
+        },
+      });
+      isUpdate = true;
+    } else {
+      // Create new pin with generic description
+      pin = await prisma.pin.create({
+        data: {
+          userId,
+          latitude,
+          longitude,
+          description: 'Mingling here!',
+          arrivalTime: arrivalTime ? new Date(arrivalTime) : null,
+          pinType: pinType || 'current',
+        },
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              image: true,
+              profile: {
+                select: { avatar: true },
+              },
+            },
+          },
+        },
+      });
+      
+      // Update user's pin count only for new pins
+      await prisma.profile.update({
+        where: { userId },
+        data: { pinsCreated: { increment: 1 } },
+      });
+    }
+    }
+    
+    // Broadcast new/updated pin to all connected users
+    broadcastToAll({
+      type: isUpdate ? 'pin_updated' : 'new_pin',
+      pin: {
+        id: pin.id,
+        latitude: pin.latitude,
+        longitude: pin.longitude,
+        description: pin.description,
+        likesCount: pin.likesCount,
+        arrivalTime: pin.arrivalTime?.toISOString() || null,
+        pinType: pin.pinType || 'current',
+        createdAt: pin.createdAt.toISOString(),
+        createdBy: {
+          id: pin.user.id,
+          name: pin.user.name,
+          image: pin.user.image,
+          avatar: pin.user.profile?.avatar,
+        },
+      },
+    });
+    
+    // Only send notifications for new pins (not location updates)
+    if (!isUpdate) {
+      notifyAboutNewPin({
+        pinId: pin.id,
+        pinUserId: pin.user.id,
+        pinUserName: pin.user.name || 'Someone',
+        pinLat: pin.latitude,
+        pinLng: pin.longitude,
+        pinDescription: pin.description,
+      }).catch(err => console.error('Notification error:', err));
+    }
+    
+    return c.json({
+      id: pin.id,
+      latitude: pin.latitude,
+      longitude: pin.longitude,
+      description: pin.description,
+      likesCount: pin.likesCount,
+      createdAt: pin.createdAt.toISOString(),
+      createdBy: {
+        id: pin.user.id,
+        name: pin.user.name,
+        image: pin.user.image,
+        avatar: pin.user.profile?.avatar,
+      },
+      updated: isUpdate,
+    }, isUpdate ? 200 : 201);
+  } catch (error) {
+    console.error('Error auto-creating pin:', error);
+    return c.json({ error: 'Failed to create pin' }, 500);
+  }
+});
+
+// GET /api/pins/user/mine - Get current user's pins
+pinRoutes.get('/user/mine', async (c) => {
+  try {
+    let userId = c.req.header('X-User-Id');
+    if (!userId) {
+      const authHeader = c.req.header('Authorization');
+      userId = extractUserIdFromToken(authHeader);
+    }
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const userPins = await prisma.pin.findMany({
+      where: { userId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            image: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return c.json(userPins.map(pin => ({
+      id: pin.id,
+      latitude: pin.latitude,
+      longitude: pin.longitude,
+      description: pin.description,
+      image: pin.image,
+      likesCount: pin.likesCount,
+      createdAt: pin.createdAt.toISOString(),
+      updatedAt: pin.updatedAt.toISOString(),
+      createdBy: {
+        id: pin.user.id,
+        name: pin.user.name,
+        image: pin.user.image,
+      },
+    })));
+  } catch (error) {
+    console.error('Error fetching user pins:', error);
+    return c.json({ error: 'Failed to fetch pins' }, 500);
+  }
+});
+
+// GET /api/pins/:id - Get single pin with full user profile
+pinRoutes.get('/:id', async (c) => {
+  try {
+    const id = c.req.param('id');
+    
+    const pin = await prisma.pin.findUnique({
+      where: { id },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            image: true,
+            profile: {
+              select: {
+                avatar: true,
+                bio: true,
+                displayName: true,
+                age: true,
+                gender: true,
+                interests: true,
+                lookingFor: true,
+                occupation: true,
+                education: true,
+                location: true,
+                languages: true,
+                lastActiveAt: true,
+                // Privacy controls
+                hideBio: true,
+                hideAge: true,
+                hideInterests: true,
+                hideLookingFor: true,
+                hideOccupation: true,
+                hideEducation: true,
+                hideLocation: true,
+                hideLanguages: true,
+              },
+            },
+          },
+        },
+        likes: {
+          select: {
+            userId: true,
+          },
+        },
+      },
+    });
+    
+    if (!pin) {
+      return c.json({ error: 'Pin not found' }, 404);
+    }
+    
+    // Parse JSON fields and respect privacy settings
+    const profile = pin.user.profile;
+    let interests: string[] = [];
+    let lookingFor: string[] = [];
+    let languages: string[] = [];
+    
+    if (profile) {
+      try {
+        if (profile.interests && !profile.hideInterests) {
+          interests = JSON.parse(profile.interests);
+        }
+      } catch {}
+      
+      try {
+        if (profile.lookingFor && !profile.hideLookingFor) {
+          lookingFor = JSON.parse(profile.lookingFor);
+        }
+      } catch {}
+      
+      try {
+        if (profile.languages && !profile.hideLanguages) {
+          languages = JSON.parse(profile.languages);
+        }
+      } catch {}
+    }
+    
+    return c.json({
+      id: pin.id,
+      userId: pin.userId,
+      latitude: pin.latitude,
+      longitude: pin.longitude,
+      description: pin.description,
+      image: pin.image,
+      photoUrl: pin.image,
+      likesCount: pin.likesCount,
+      likedByUser: false,
+      createdAt: pin.createdAt.toISOString(),
+      user: {
+        id: pin.user.id,
+        name: pin.user.name,
+        image: pin.user.image,
+        avatar: profile?.avatar,
+        displayName: profile?.displayName,
+        bio: profile?.hideBio ? null : profile?.bio,
+        age: profile?.hideAge ? null : profile?.age,
+        gender: profile?.gender,
+        interests: profile?.hideInterests ? null : interests,
+        lookingFor: profile?.hideLookingFor ? null : lookingFor,
+        occupation: profile?.hideOccupation ? null : profile?.occupation,
+        education: profile?.hideEducation ? null : profile?.education,
+        location: profile?.hideLocation ? null : profile?.location,
+        languages: profile?.hideLanguages ? null : languages,
+        lastActiveAt: profile?.lastActiveAt,
+        // Include privacy flags so frontend knows if hidden vs just empty
+        privacy: {
+          hideBio: profile?.hideBio || false,
+          hideAge: profile?.hideAge || false,
+          hideInterests: profile?.hideInterests || false,
+          hideLookingFor: profile?.hideLookingFor || false,
+          hideOccupation: profile?.hideOccupation || false,
+          hideEducation: profile?.hideEducation || false,
+          hideLocation: profile?.hideLocation || false,
+          hideLanguages: profile?.hideLanguages || false,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching pin:', error);
+    return c.json({ error: 'Failed to fetch pin' }, 500);
+  }
+});
+
+// POST /api/pins - Create a new pin
+pinRoutes.post('/', checkUsageLimit('pin'), async (c) => {
+  try {
+    let userId = c.req.header('X-User-Id');
+    if (!userId) {
+      const authHeader = c.req.header('Authorization');
+      userId = extractUserIdFromToken(authHeader);
+    }
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    
+    const body = await c.req.json();
+    const createSchema = z.object({
+      latitude: z.number(),
+      longitude: z.number(),
+      description: z.string().min(1).max(500),
+      image: z.string().optional(),
+    });
+    
+    const parsed = createSchema.safeParse(body);
+    
+    if (!parsed.success) {
+      return c.json({ error: 'Invalid data', details: parsed.error.errors }, 400);
+    }
+    
+    const { latitude, longitude, description, image } = parsed.data;
+    
+    const pin = await prisma.pin.create({
+      data: {
+        userId,
+        latitude,
+        longitude,
+        description,
+        image,
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            image: true,
+            profile: {
+              select: { avatar: true },
+            },
+          },
+        },
+      },
+    });
+    
+    // Update user's pin count
+    await prisma.profile.update({
+      where: { userId },
+      data: { pinsCreated: { increment: 1 } },
+    });
+    
+    // Broadcast new pin to all connected users
+    broadcastToAll({
+      type: 'new_pin',
+      pin: {
+        id: pin.id,
+        latitude: pin.latitude,
+        longitude: pin.longitude,
+        description: pin.description,
+        image: pin.image,
+        likesCount: 0,
+        createdAt: pin.createdAt.toISOString(),
+        createdBy: {
+          id: pin.user.id,
+          name: pin.user.name,
+          image: pin.user.image,
+          avatar: pin.user.profile?.avatar,
+        },
+      },
+    });
+    
+    // Trigger notifications to friends and nearby users (async, don't wait)
+    notifyAboutNewPin({
+      pinId: pin.id,
+      pinUserId: pin.user.id,
+      pinUserName: pin.user.name || 'Someone',
+      pinLat: pin.latitude,
+      pinLng: pin.longitude,
+      pinDescription: pin.description,
+    }).catch(err => console.error('Notification error:', err));
+    
+    return c.json({
+      id: pin.id,
+      latitude: pin.latitude,
+      longitude: pin.longitude,
+      description: pin.description,
+      image: pin.image,
+      likesCount: 0,
+      createdAt: pin.createdAt.toISOString(),
+      createdBy: {
+        id: pin.user.id,
+        name: pin.user.name,
+        image: pin.user.image,
+        avatar: pin.user.profile?.avatar,
+      },
+    }, 201);
+  } catch (error) {
+    console.error('Error creating pin:', error);
+    return c.json({ error: 'Failed to create pin' }, 500);
+  }
+});
+
+// POST /api/pins/:id/like - Like/unlike a pin
+pinRoutes.post('/:id/like', async (c) => {
+  try {
+    let userId = c.req.header('X-User-Id');
+    if (!userId) {
+      const authHeader = c.req.header('Authorization');
+      userId = extractUserIdFromToken(authHeader);
+    }
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    
+    const pinId = c.req.param('id');
+    
+    // Check if pin exists
+    const pin = await prisma.pin.findUnique({ where: { id: pinId } });
+    if (!pin) {
+      return c.json({ error: 'Pin not found' }, 404);
+    }
+    
+    // Check if already liked
+    const existingLike = await prisma.pinLike.findUnique({
+      where: { pinId_userId: { pinId, userId } },
+    });
+    
+    if (existingLike) {
+      // Unlike
+      await prisma.pinLike.delete({
+        where: { id: existingLike.id },
+      });
+      await prisma.pin.update({
+        where: { id: pinId },
+        data: { likesCount: { decrement: 1 } },
+      });
+      
+      return c.json({ liked: false, likesCount: pin.likesCount - 1 });
+    } else {
+      // Like
+      await prisma.pinLike.create({
+        data: { pinId, userId },
+      });
+      await prisma.pin.update({
+        where: { id: pinId },
+        data: { likesCount: { increment: 1 } },
+      });
+      
+      // Update pin creator's likes received count
+      await prisma.profile.update({
+        where: { userId: pin.userId },
+        data: { 
+          likesReceived: { increment: 1 },
+          positiveInteractions: { increment: 1 },
+        },
+      });
+      
+      // Notify pin owner about the like (if not liking own pin)
+      if (pin.userId !== userId) {
+        const liker = await prisma.user.findUnique({
+          where: { id: userId },
+          select: { name: true, profile: { select: { displayName: true } } },
+        });
+        const likerName = liker?.profile?.displayName || liker?.name || 'Someone';
+        notifyAboutPinLike(pin.userId, userId, likerName, pinId)
+          .catch(err => console.error('Like notification error:', err));
+      }
+      
+      return c.json({ liked: true, likesCount: pin.likesCount + 1 });
+    }
+  } catch (error) {
+    console.error('Error liking pin:', error);
+    return c.json({ error: 'Failed to like pin' }, 500);
+  }
+});
+
+
+
+// DELETE /api/pins/:id - Delete a pin
+pinRoutes.delete('/:id', async (c) => {
+  try {
+    let userId = c.req.header('X-User-Id');
+    if (!userId) {
+      const authHeader = c.req.header('Authorization');
+      userId = extractUserIdFromToken(authHeader);
+    }
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    
+    const pinId = c.req.param('id');
+    
+    // Check ownership
+    const pin = await prisma.pin.findUnique({ where: { id: pinId } });
+    if (!pin) {
+      return c.json({ error: 'Pin not found' }, 404);
+    }
+    if (pin.userId !== userId) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    
+    await prisma.pin.delete({ where: { id: pinId } });
+    
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting pin:', error);
+    return c.json({ error: 'Failed to delete pin' }, 500);
+  }
+});
+
+// POST /api/pins/cleanup - Auto-delete pins older than 7 days
+// This can be called by a cron job or manually
+pinRoutes.post('/cleanup', async (c) => {
+  try {
+    const now = new Date();
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    
+    // Find all pins to delete
+    const pinsToDelete = await prisma.pin.findMany({
+      where: {
+        OR: [
+          // Delete old current location pins
+          {
+            pinType: 'current',
+            createdAt: { lt: sevenDaysAgo }
+          },
+          // Delete future pins where arrival time was 7+ days ago
+          {
+            pinType: 'future',
+            arrivalTime: { lt: sevenDaysAgo }
+          }
+        ]
+      },
+      select: { id: true, pinType: true, createdAt: true, arrivalTime: true }
+    });
+    
+    // Delete them
+    const deleteResult = await prisma.pin.deleteMany({
+      where: {
+        id: { in: pinsToDelete.map(p => p.id) }
+      }
+    });
+    
+    console.log(`Cleaned up ${deleteResult.count} expired pins`);
+    
+    return c.json({ 
+      success: true, 
+      deletedCount: deleteResult.count,
+      pins: pinsToDelete
+    });
+  } catch (error) {
+    console.error('Error cleaning up pins:', error);
+    return c.json({ error: 'Failed to cleanup pins' }, 500);
+  }
+});
