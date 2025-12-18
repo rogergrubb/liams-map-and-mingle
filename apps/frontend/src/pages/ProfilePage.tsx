@@ -1,0 +1,234 @@
+import { useState, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
+import { Settings, Crown, Award, Flame, MapPin, Calendar, Heart, MessageCircle, LogOut, Share2 } from "lucide-react";
+import { useAuthStore } from "../stores/authStore";
+import MyPinsManager from "../components/profile/MyPinsManager";
+import { PhotoGallery } from "../components/profile/PhotoGallery";
+import { InviteFriends } from "../components/InviteFriends";
+import api from "../lib/api";
+
+interface UserStats {
+  pinsCount: number;
+  eventsCount: number;
+  likesCount: number;
+  chatsCount: number;
+}
+
+export default function ProfilePage() {
+  const navigate = useNavigate();
+  const { user, logout } = useAuthStore();
+  const [showInviteModal, setShowInviteModal] = useState(false);
+  const [stats, setStats] = useState<UserStats>({
+    pinsCount: 0,
+    eventsCount: 0,
+    likesCount: 0,
+    chatsCount: 0
+  });
+
+  useEffect(() => {
+    loadStats();
+  }, []);
+
+  const loadStats = async () => {
+    try {
+      const response: any = await api.get("/api/users/me/stats");
+      if (response) {
+        setStats({
+          pinsCount: response.pinsCount || 0,
+          eventsCount: response.eventsCount || 0,
+          likesCount: response.likesCount || 0,
+          chatsCount: response.chatsCount || 0
+        });
+      }
+    } catch (err) {
+      console.error("Failed to load stats:", err);
+    }
+  };
+
+  if (!user) {
+    return (
+      <div className="h-full flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-500"></div>
+      </div>
+    );
+  }
+
+  const displayName = user.displayName || user.name || user.email?.split("@")[0] || "User";
+  const username = user.username || user.email?.split("@")[0] || "user";
+  const bio = user.bio || "";
+  const avatar = user.avatar || "";
+  const trustScore = user.trustScore || 50;
+  const streak = user.streak || 0;
+  const isPremium = user.isPremium || false;
+  const isVerified = user.isVerified || false;
+
+  const statItems = [
+    { label: "Pins", value: stats.pinsCount, icon: MapPin },
+    { label: "Events", value: stats.eventsCount, icon: Calendar },
+    { label: "Likes", value: stats.likesCount, icon: Heart },
+    { label: "Chats", value: stats.chatsCount, icon: MessageCircle },
+  ];
+
+  const menuItems = [
+    { label: "Edit Profile", path: "/settings/edit-profile", icon: Settings },
+    { label: "Invite Friends", action: () => setShowInviteModal(true), icon: Share2, highlight: true },
+    { label: "Saved Pins", path: "/settings/saved-pins", icon: MapPin },
+    { label: "Privacy & Safety", path: "/settings/privacy", icon: Settings },
+    { label: "Notifications", path: "/settings/notifications", icon: Settings },
+    { label: "Subscription", path: "/settings/subscription", icon: Crown },
+    { label: "Account", path: "/settings/account", icon: Settings },
+    { label: "Help & Support", path: "/settings/help", icon: Settings },
+  ];
+
+  return (
+    <div className="h-full overflow-y-auto bg-gray-50">
+      <div className="bg-gradient-to-br from-primary-500 to-purple-600 h-32"></div>
+
+      <div className="bg-white -mt-16 mx-4 rounded-2xl shadow-lg p-6 mb-4">
+        <div className="flex flex-col items-center -mt-16 mb-4">
+          <div className="relative">
+            {user.avatar ? (
+              <img
+                src={avatar}
+                alt={displayName}
+                className="w-24 h-24 rounded-full border-4 border-white object-cover"
+              />
+            ) : (
+              <div className="w-24 h-24 rounded-full border-4 border-white bg-primary-100 flex items-center justify-center">
+                <span className="text-primary-600 font-bold text-3xl">
+                  {displayName[0].toUpperCase()}
+                </span>
+              </div>
+            )}
+            {isPremium && (
+              <div className="absolute -top-1 -right-1 bg-yellow-400 rounded-full p-1">
+                <Crown size={16} className="text-white" />
+              </div>
+            )}
+            {isVerified && (
+              <div className="absolute bottom-0 right-0 bg-blue-500 rounded-full p-1">
+                <Award size={16} className="text-white" />
+              </div>
+            )}
+          </div>
+
+          <h1 className="text-2xl font-bold text-gray-900 mt-4">{displayName}</h1>
+          <p className="text-gray-600">@{username}</p>
+
+          {bio && (
+            <p className="text-gray-700 text-center mt-2 max-w-md">{bio}</p>
+          )}
+
+          <div className="flex items-center space-x-4 mt-4">
+            <div className="flex items-center space-x-1">
+              <Award size={16} className="text-yellow-500" />
+              <span className="text-sm font-medium">{trustScore} Trust</span>
+            </div>
+            <div className="flex items-center space-x-1">
+              <Flame size={16} className="text-orange-500" />
+              <span className="text-sm font-medium">{streak} Day Streak</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-4 gap-4 pt-4 border-t border-gray-100">
+          {statItems.map(({ label, value, icon: Icon }) => (
+            <div key={label} className="text-center">
+              <Icon size={20} className="mx-auto text-gray-400 mb-1" />
+              <p className="text-lg font-bold text-gray-900">{value}</p>
+              <p className="text-xs text-gray-600">{label}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Photo Gallery */}
+      <div className="mx-4 mb-4">
+        <PhotoGallery userId={user.id} isOwner={true} />
+      </div>
+
+      <div className="bg-white mx-4 rounded-2xl shadow-lg p-6 mb-4">
+        <MyPinsManager />
+      </div>
+
+      {user.interests && user.interests.length > 0 && (
+        <div className="bg-white mx-4 rounded-2xl shadow-sm p-4 mb-4">
+          <h2 className="font-semibold text-gray-900 mb-3">Interests</h2>
+          <div className="flex flex-wrap gap-2">
+            {user.interests.map((interest) => (
+              <span key={interest} className="badge badge-primary">
+                {interest}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {user.lookingFor && user.lookingFor.length > 0 && (
+        <div className="bg-white mx-4 rounded-2xl shadow-sm p-4 mb-4">
+          <h2 className="font-semibold text-gray-900 mb-3">Looking For</h2>
+          <div className="flex flex-wrap gap-2">
+            {user.lookingFor.map((item: string) => {
+              const config: Record<string, { emoji: string; color: string }> = {
+                dating: { emoji: '💕', color: 'bg-pink-100 text-pink-700' },
+                friends: { emoji: '👯', color: 'bg-purple-100 text-purple-700' },
+                networking: { emoji: '💼', color: 'bg-blue-100 text-blue-700' },
+                events: { emoji: '🎉', color: 'bg-green-100 text-green-700' },
+                travel: { emoji: '✈️', color: 'bg-orange-100 text-orange-700' },
+              };
+              const cfg = config[item] || { emoji: '🔹', color: 'bg-gray-100 text-gray-700' };
+              return (
+                <span key={item} className={`px-3 py-1.5 rounded-full text-sm font-medium ${cfg.color}`}>
+                  {cfg.emoji} {item.charAt(0).toUpperCase() + item.slice(1)}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      <div className="bg-white mx-4 rounded-2xl shadow-sm mb-4 overflow-hidden">
+        {menuItems.map((item, index) => {
+          const isLast = index === menuItems.length - 1;
+          const borderClass = isLast ? "" : "border-b border-gray-100";
+          const ItemIcon = item.icon;
+          const isHighlight = 'highlight' in item && item.highlight;
+          
+          return (
+            <button
+              key={item.label}
+              onClick={() => {
+                if ('action' in item && item.action) {
+                  item.action();
+                } else if ('path' in item && item.path) {
+                  navigate(item.path);
+                }
+              }}
+              className={`w-full flex items-center justify-between p-4 hover:bg-gray-50 transition-colors ${borderClass} ${isHighlight ? 'bg-gradient-to-r from-pink-50 to-purple-50' : ''}`}
+            >
+              <div className="flex items-center space-x-3">
+                <ItemIcon size={20} className={isHighlight ? 'text-pink-500' : 'text-gray-600'} />
+                <span className={`font-medium ${isHighlight ? 'text-pink-600' : 'text-gray-900'}`}>{item.label}</span>
+              </div>
+              <span className="text-gray-400">›</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <button
+        onClick={logout}
+        className="w-full bg-white mx-4 rounded-2xl shadow-sm p-4 mb-8 flex items-center justify-center space-x-2 text-red-600 hover:bg-red-50 transition-colors"
+      >
+        <LogOut size={20} />
+        <span className="font-medium">Log Out</span>
+      </button>
+
+      {/* Invite Friends Modal */}
+      <InviteFriends 
+        isOpen={showInviteModal} 
+        onClose={() => setShowInviteModal(false)} 
+      />
+    </div>
+  );
+}
