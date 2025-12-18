@@ -1,0 +1,1111 @@
+import { Hono } from 'hono';
+import { prisma } from '../index';
+import { authMiddleware } from '../middleware/auth';
+
+// Define context variables type for TypeScript
+type Variables = {
+  userId: string;
+};
+
+export const userRoutes = new Hono<{ Variables: Variables }>();
+
+// GET /api/users/me - Get current user's profile
+userRoutes.get('/me', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { profile: true },
+    });
+
+    if (!user) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    // Parse interests
+    let interests: string[] = [];
+    if (user.profile?.interests) {
+      try {
+        interests = JSON.parse(user.profile.interests);
+      } catch {}
+    }
+
+    // Parse lookingFor
+    let lookingFor: string[] = [];
+    if (user.profile?.lookingFor) {
+      try {
+        lookingFor = JSON.parse(user.profile.lookingFor);
+      } catch {}
+    }
+
+    return c.json({
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      image: user.image,
+      displayName: user.profile?.displayName || user.name || 'Anonymous',
+      username: user.profile?.handle || user.id.slice(0, 8),
+      avatar: user.profile?.avatar || user.image,
+      bio: user.profile?.bio,
+      interests,
+      lookingFor,
+      activityIntent: user.profile?.activityIntent,
+      chatReadiness: user.profile?.chatReadiness || 'browsing_only',
+      visibilityMode: user.profile?.visibilityMode || 'public',
+      ghostMode: user.profile?.ghostMode || false,
+      trustScore: user.profile?.trustScore || 50,
+      trustLevel: user.profile?.trustLevel || 'new',
+      subscriptionStatus: user.profile?.subscriptionStatus || 'trial',
+      // Campus Layer fields
+      primarySchool: user.profile?.primarySchool,
+      schoolRole: user.profile?.schoolRole,
+      gradYear: user.profile?.gradYear,
+      schoolVerified: user.profile?.schoolVerified || false,
+      // Onboarding & Referral
+      onboardingComplete: user.profile?.onboardingComplete || false,
+      onboardingStep: user.profile?.onboardingStep,
+      referralCode: user.profile?.referralCode,
+      createdAt: user.createdAt.toISOString(),
+      lastActive: user.profile?.lastActiveAt?.toISOString(),
+    });
+  } catch (error) {
+    console.error('Error fetching current user:', error);
+    return c.json({ error: 'Failed to fetch user profile' }, 500);
+  }
+});
+
+// GET /api/users/me/stats - Get current user's stats
+userRoutes.get('/me/stats', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    // Count pins
+    const pinsCount = await prisma.pin.count({
+      where: { userId }
+    });
+
+    // Count events hosted
+    const eventsCount = await prisma.event.count({
+      where: { hostId: userId }
+    });
+
+    // Count likes received on user's pins
+    const likesCount = await prisma.pinLike.count({
+      where: {
+        pin: {
+          userId: userId
+        }
+      }
+    });
+
+    // Count unique conversations
+    const sentMessages = await prisma.message.findMany({
+      where: { senderId: userId },
+      select: { receiverId: true },
+      distinct: ['receiverId']
+    });
+    const receivedMessages = await prisma.message.findMany({
+      where: { receiverId: userId },
+      select: { senderId: true },
+      distinct: ['senderId']
+    });
+    const uniquePartners = new Set([
+      ...sentMessages.map(m => m.receiverId),
+      ...receivedMessages.map(m => m.senderId)
+    ]);
+    const chatsCount = uniquePartners.size;
+
+    return c.json({
+      pinsCount,
+      eventsCount,
+      likesCount,
+      chatsCount
+    });
+  } catch (error) {
+    console.error('Error fetching user stats:', error);
+    return c.json({ error: 'Failed to fetch stats' }, 500);
+  }
+});
+
+// Helper function to generate referral code
+function generateReferralCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Removed confusing chars like 0, O, 1, I
+  let code = '';
+  for (let i = 0; i < 8; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+}
+
+// GET /api/users/me/referral-code - Get or generate user's referral code
+userRoutes.get('/me/referral-code', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+
+    const profile = await prisma.profile.findUnique({
+      where: { userId },
+      select: { referralCode: true },
+    });
+
+    if (!profile) {
+      return c.json({ error: 'Profile not found' }, 404);
+    }
+
+    // If user already has a referral code, return it
+    if (profile.referralCode) {
+      return c.json({ 
+        referralCode: profile.referralCode,
+        shareUrl: `https://www.mapandmingle.com/join/${profile.referralCode}`,
+      });
+    }
+
+    // Generate a new unique referral code
+    let newCode = generateReferralCode();
+    let attempts = 0;
+    while (attempts < 10) {
+      const existing = await prisma.profile.findFirst({
+        where: { referralCode: newCode },
+      });
+      if (!existing) break;
+      newCode = generateReferralCode();
+      attempts++;
+    }
+
+    // Save the code
+    await prisma.profile.update({
+      where: { userId },
+      data: { referralCode: newCode },
+    });
+
+    return c.json({ 
+      referralCode: newCode,
+      shareUrl: `https://www.mapandmingle.com/join/${newCode}`,
+    });
+  } catch (error) {
+    console.error('Error generating referral code:', error);
+    return c.json({ error: 'Failed to generate referral code' }, 500);
+  }
+});
+
+// GET /api/users/referral/:code - Get info about who invited (public endpoint)
+userRoutes.get('/referral/:code', async (c) => {
+  try {
+    const code = c.req.param('code').toUpperCase();
+
+    const profile = await prisma.profile.findFirst({
+      where: { referralCode: code },
+      include: {
+        user: {
+          select: { name: true, image: true },
+        },
+      },
+    });
+
+    if (!profile) {
+      return c.json({ error: 'Invalid referral code' }, 404);
+    }
+
+    return c.json({
+      valid: true,
+      referrerName: profile.displayName || profile.user.name || 'A friend',
+      referrerAvatar: profile.avatar || profile.user.image,
+    });
+  } catch (error) {
+    console.error('Error checking referral code:', error);
+    return c.json({ error: 'Failed to check referral code' }, 500);
+  }
+});
+
+// POST /api/users/onboarding/complete - Mark onboarding as complete
+userRoutes.post('/onboarding/complete', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+
+    await prisma.profile.update({
+      where: { userId },
+      data: { 
+        onboardingComplete: true,
+        onboardingStep: null,
+      },
+    });
+
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('Error completing onboarding:', error);
+    return c.json({ error: 'Failed to complete onboarding' }, 500);
+  }
+});
+
+// PATCH /api/users/onboarding/step - Update current onboarding step
+userRoutes.patch('/onboarding/step', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+    const { step } = await c.req.json();
+
+    await prisma.profile.update({
+      where: { userId },
+      data: { onboardingStep: step },
+    });
+
+    return c.json({ success: true, step });
+  } catch (error) {
+    console.error('Error updating onboarding step:', error);
+    return c.json({ error: 'Failed to update onboarding step' }, 500);
+  }
+});
+
+// PATCH /api/users/me - Update current user's profile
+userRoutes.patch('/me', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const body = await c.req.json();
+    const {
+      displayName,
+      bio,
+      avatar,
+      interests,
+      lookingFor,
+      activityIntent,
+      chatReadiness,
+      visibilityMode,
+      ghostMode,
+      // Campus Layer fields
+      primarySchool,
+      schoolRole,
+      gradYear,
+    } = body;
+
+    // Ensure user exists
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { profile: true },
+    });
+
+    if (!user) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    // Prepare profile update data
+    const profileData: any = {};
+
+    if (displayName !== undefined) profileData.displayName = displayName;
+    if (bio !== undefined) profileData.bio = bio;
+    if (avatar !== undefined) profileData.avatar = avatar;
+    if (interests !== undefined) {
+      // Convert array to JSON string for storage
+      profileData.interests = JSON.stringify(interests);
+    }
+    if (lookingFor !== undefined) {
+      // Convert array to JSON string for storage
+      profileData.lookingFor = JSON.stringify(lookingFor);
+    }
+    if (activityIntent !== undefined) profileData.activityIntent = activityIntent;
+    if (chatReadiness !== undefined) profileData.chatReadiness = chatReadiness;
+    if (visibilityMode !== undefined) profileData.visibilityMode = visibilityMode;
+    if (ghostMode !== undefined) profileData.ghostMode = ghostMode;
+
+    // Campus Layer fields
+    if (primarySchool !== undefined) profileData.primarySchool = primarySchool;
+    if (schoolRole !== undefined) profileData.schoolRole = schoolRole;
+    if (gradYear !== undefined) profileData.gradYear = gradYear;
+    
+    // Auto-verify if user's email is .edu domain
+    if (primarySchool && user?.email) {
+      const emailDomain = user.email.split('@')[1]?.toLowerCase() || '';
+      const eduDomains = ['.edu', '.ac.uk', '.edu.au', '.edu.cn', '.edu.in', '.ac.jp', '.edu.mx', '.edu.sg'];
+      const isEduEmail = eduDomains.some(d => emailDomain.endsWith(d));
+      if (isEduEmail) {
+        profileData.schoolVerified = true;
+      }
+    }
+
+    // Update or create profile
+    if (user.profile) {
+      // Update existing profile
+      await prisma.profile.update({
+        where: { userId },
+        data: profileData,
+      });
+    } else {
+      // Create new profile
+      await prisma.profile.create({
+        data: {
+          userId,
+          ...profileData,
+        },
+      });
+    }
+
+    // Fetch updated user with profile
+    const updatedUser = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { profile: true },
+    });
+
+    // Parse interests for response
+    let parsedInterests: string[] = [];
+    if (updatedUser?.profile?.interests) {
+      try {
+        parsedInterests = JSON.parse(updatedUser.profile.interests);
+      } catch {}
+    }
+
+    // Parse lookingFor for response
+    let parsedLookingFor: string[] = [];
+    if (updatedUser?.profile?.lookingFor) {
+      try {
+        parsedLookingFor = JSON.parse(updatedUser.profile.lookingFor);
+      } catch {}
+    }
+
+    return c.json({
+      id: updatedUser!.id,
+      email: updatedUser!.email,
+      name: updatedUser!.name,
+      image: updatedUser!.image,
+      displayName: updatedUser!.profile?.displayName || updatedUser!.name || 'Anonymous',
+      username: updatedUser!.profile?.handle || updatedUser!.id.slice(0, 8),
+      avatar: updatedUser!.profile?.avatar || updatedUser!.image,
+      bio: updatedUser!.profile?.bio,
+      interests: parsedInterests,
+      lookingFor: parsedLookingFor,
+      activityIntent: updatedUser!.profile?.activityIntent,
+      chatReadiness: updatedUser!.profile?.chatReadiness || 'browsing_only',
+      visibilityMode: updatedUser!.profile?.visibilityMode || 'public',
+      ghostMode: updatedUser!.profile?.ghostMode || false,
+      trustScore: updatedUser!.profile?.trustScore || 50,
+      trustLevel: updatedUser!.profile?.trustLevel || 'new',
+      subscriptionStatus: updatedUser!.profile?.subscriptionStatus || 'trial',
+      // Campus Layer fields
+      primarySchool: updatedUser!.profile?.primarySchool,
+      schoolRole: updatedUser!.profile?.schoolRole,
+      gradYear: updatedUser!.profile?.gradYear,
+      schoolVerified: updatedUser!.profile?.schoolVerified || false,
+      createdAt: updatedUser!.createdAt.toISOString(),
+      lastActive: updatedUser!.profile?.lastActiveAt?.toISOString(),
+    });
+  } catch (error) {
+    console.error('Error updating user profile:', error);
+    return c.json({ error: 'Failed to update profile' }, 500);
+  }
+});
+
+// PUT /api/users/profile - Update user profile (alias for web app onboarding)
+userRoutes.put('/profile', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const body = await c.req.json();
+    const {
+      displayName,
+      bio,
+      age,
+      gender,
+      location,
+      avatar,
+      interests,
+      lookingFor,
+      activityIntent,
+      chatReadiness,
+      visibilityMode,
+      ghostMode,
+      // Campus Layer fields
+      primarySchool,
+      schoolRole,
+      gradYear,
+    } = body;
+
+    // Ensure user exists
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { profile: true },
+    });
+
+    if (!user) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    // Prepare profile update data
+    const profileData: any = {};
+
+    if (displayName !== undefined) profileData.displayName = displayName;
+    if (bio !== undefined) profileData.bio = bio;
+    if (age !== undefined) profileData.age = age;
+    if (gender !== undefined) profileData.gender = gender;
+    if (location !== undefined) profileData.location = location;
+    if (avatar !== undefined) profileData.avatar = avatar;
+    if (interests !== undefined) {
+      // Already JSON string from frontend
+      profileData.interests = interests;
+    }
+    if (lookingFor !== undefined) {
+      // Already JSON string from frontend
+      profileData.lookingFor = lookingFor;
+    }
+    if (activityIntent !== undefined) profileData.activityIntent = activityIntent;
+    if (chatReadiness !== undefined) profileData.chatReadiness = chatReadiness;
+    if (visibilityMode !== undefined) profileData.visibilityMode = visibilityMode;
+    if (ghostMode !== undefined) profileData.ghostMode = ghostMode;
+
+    // Campus Layer fields
+    if (primarySchool !== undefined) profileData.primarySchool = primarySchool;
+    if (schoolRole !== undefined) profileData.schoolRole = schoolRole;
+    if (gradYear !== undefined) profileData.gradYear = gradYear;
+    
+    // Auto-verify if user's email is .edu domain
+    if (primarySchool && user?.email) {
+      const emailDomain = user.email.split('@')[1]?.toLowerCase() || '';
+      const eduDomains = ['.edu', '.ac.uk', '.edu.au', '.edu.cn', '.edu.in', '.ac.jp', '.edu.mx', '.edu.sg'];
+      const isEduEmail = eduDomains.some(d => emailDomain.endsWith(d));
+      if (isEduEmail) {
+        profileData.schoolVerified = true;
+      }
+    }
+
+    // Update or create profile
+    if (user.profile) {
+      // Update existing profile
+      await prisma.profile.update({
+        where: { userId },
+        data: profileData,
+      });
+    } else {
+      // Create new profile
+      await prisma.profile.create({
+        data: {
+          userId,
+          ...profileData,
+        },
+      });
+    }
+
+    // Fetch updated user with profile
+    const updatedUser = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { profile: true },
+    });
+
+    return c.json({
+      success: true,
+      user: updatedUser,
+    });
+  } catch (error) {
+    console.error('Error updating user profile:', error);
+    return c.json({ error: 'Failed to update profile' }, 500);
+  }
+});
+
+// GET /api/users/search - Search users
+userRoutes.get('/search', async (c) => {
+  try {
+    const userId = c.req.header('x-user-id');
+    const q = c.req.query('q') || '';
+    const filter = c.req.query('filter') || 'all';
+    const lat = c.req.query('lat') ? parseFloat(c.req.query('lat')!) : null;
+    const lng = c.req.query('lng') ? parseFloat(c.req.query('lng')!) : null;
+    const limit = parseInt(c.req.query('limit') || '20');
+
+    if (!q || q.length < 1) {
+      return c.json({ users: [] });
+    }
+
+    // Build where clause
+    const where: any = {
+      AND: [
+        // Exclude self
+        userId ? { id: { not: userId } } : {},
+        // Search in name, displayName, or handle
+        {
+          OR: [
+            { name: { contains: q, mode: 'insensitive' } },
+            { profile: { displayName: { contains: q, mode: 'insensitive' } } },
+            { profile: { handle: { contains: q, mode: 'insensitive' } } },
+          ],
+        },
+        // Visibility filter
+        { profile: { visibilityMode: { not: 'hidden' } } },
+      ],
+    };
+
+    // Online filter - last active within 5 minutes
+    if (filter === 'online') {
+      where.AND.push({
+        profile: {
+          lastActiveAt: { gte: new Date(Date.now() - 5 * 60 * 1000) },
+        },
+      });
+    }
+
+    // Get current user's interests for matching
+    let currentUserInterests: string[] = [];
+    if (userId) {
+      const currentUser = await prisma.profile.findUnique({
+        where: { userId },
+        select: { interests: true },
+      });
+      if (currentUser?.interests) {
+        try {
+          currentUserInterests = JSON.parse(currentUser.interests);
+        } catch {}
+      }
+    }
+
+    // Get blocked user IDs
+    let blockedIds: string[] = [];
+    if (userId) {
+      const blocks = await prisma.block.findMany({
+        where: {
+          OR: [{ blockerId: userId }, { blockedUserId: userId }],
+        },
+        select: { blockerId: true, blockedUserId: true },
+      });
+      blockedIds = blocks.map((b) =>
+        b.blockerId === userId ? b.blockedUserId : b.blockerId
+      );
+    }
+
+    // Query users
+    const users = await prisma.user.findMany({
+      where,
+      take: limit,
+      include: {
+        profile: true,
+      },
+      orderBy: [
+        { profile: { lastActiveAt: 'desc' } },
+        { createdAt: 'desc' },
+      ],
+    });
+
+    // Process results
+    let results = users
+      .filter((u) => !blockedIds.includes(u.id))
+      .map((user) => {
+        // Parse interests
+        let userInterests: string[] = [];
+        if (user.profile?.interests) {
+          try {
+            userInterests = JSON.parse(user.profile.interests);
+          } catch {}
+        }
+
+        // Find shared interests
+        const sharedInterests = currentUserInterests.filter((i) =>
+          userInterests.includes(i)
+        );
+
+        // Calculate distance if coordinates provided
+        let distance: number | undefined;
+        if (lat && lng && user.profile?.currentLocationLat && user.profile?.currentLocationLng) {
+          distance = calculateDistance(
+            lat,
+            lng,
+            user.profile.currentLocationLat,
+            user.profile.currentLocationLng
+          );
+        }
+
+        return {
+          id: user.id,
+          displayName: user.profile?.displayName || user.name || 'Anonymous',
+          username: user.profile?.handle || user.id.slice(0, 8),
+          avatar: user.profile?.avatar || user.image,
+          bio: user.profile?.bio,
+          activityIntent: user.profile?.activityIntent,
+          chatReadiness: user.profile?.chatReadiness || 'browsing_only',
+          trustScore: user.profile?.trustScore || 50,
+          interests: userInterests.slice(0, 5),
+          sharedInterests,
+          distance,
+          isVerified: (user.profile?.trustLevel === 'verified' || user.profile?.trustLevel === 'vip'),
+          lastActive: user.profile?.lastActiveAt?.toISOString(),
+        };
+      });
+
+    // Sort by distance if nearby filter
+    if (filter === 'nearby' && lat && lng) {
+      results = results
+        .filter((u) => u.distance !== undefined)
+        .sort((a, b) => (a.distance || Infinity) - (b.distance || Infinity));
+    }
+
+    return c.json({ users: results });
+  } catch (error) {
+    console.error('Error searching users:', error);
+    return c.json({ error: 'Failed to search users' }, 500);
+  }
+});
+
+// GET /api/users/nearby - Get nearby users
+userRoutes.get('/nearby', async (c) => {
+  try {
+    const userId = c.req.header('x-user-id');
+    const lat = parseFloat(c.req.query('lat') || '0');
+    const lng = parseFloat(c.req.query('lng') || '0');
+    const radius = parseInt(c.req.query('radius') || '5000'); // meters
+    const limit = parseInt(c.req.query('limit') || '50');
+
+    if (!lat || !lng) {
+      return c.json({ error: 'Latitude and longitude required' }, 400);
+    }
+
+    // Get users who have shared location recently (last hour)
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+
+    const where: any = {
+      AND: [
+        userId ? { id: { not: userId } } : {},
+        { profile: { ghostMode: false } },
+        { profile: { visibilityMode: { not: 'hidden' } } },
+        { profile: { currentLocationLat: { not: null } } },
+        { profile: { currentLocationLng: { not: null } } },
+        // Recent location update
+        { profile: { lastActiveAt: { gte: oneHourAgo } } },
+      ],
+    };
+
+    // Get blocked user IDs
+    let blockedIds: string[] = [];
+    if (userId) {
+      const blocks = await prisma.block.findMany({
+        where: {
+          OR: [{ blockerId: userId }, { blockedUserId: userId }],
+        },
+        select: { blockerId: true, blockedUserId: true },
+      });
+      blockedIds = blocks.map((b) =>
+        b.blockerId === userId ? b.blockedUserId : b.blockerId
+      );
+    }
+
+    // Get current user's interests
+    let currentUserInterests: string[] = [];
+    if (userId) {
+      const currentUser = await prisma.profile.findUnique({
+        where: { userId },
+        select: { interests: true },
+      });
+      if (currentUser?.interests) {
+        try {
+          currentUserInterests = JSON.parse(currentUser.interests);
+        } catch {}
+      }
+    }
+
+    const users = await prisma.user.findMany({
+      where,
+      take: limit * 2, // Get extra to account for distance filtering
+      include: { profile: true },
+    });
+
+    // Filter by distance and format
+    const nearbyUsers = users
+      .filter((u) => !blockedIds.includes(u.id))
+      .filter((user) => {
+        if (!user.profile?.currentLocationLat || !user.profile?.currentLocationLng) return false;
+        const distance = calculateDistance(
+          lat,
+          lng,
+          user.profile.currentLocationLat,
+          user.profile.currentLocationLng
+        );
+        return distance <= radius;
+      })
+      .map((user) => {
+        const distance = calculateDistance(
+          lat,
+          lng,
+          user.profile!.currentLocationLat!,
+          user.profile!.currentLocationLng!
+        );
+
+        // Parse interests
+        let userInterests: string[] = [];
+        if (user.profile?.interests) {
+          try {
+            userInterests = JSON.parse(user.profile.interests);
+          } catch {}
+        }
+
+        const sharedInterests = currentUserInterests.filter((i) =>
+          userInterests.includes(i)
+        );
+
+        return {
+          id: user.id,
+          displayName: user.profile?.displayName || user.name || 'Anonymous',
+          username: user.profile?.handle || user.id.slice(0, 8),
+          avatar: user.profile?.avatar || user.image,
+          bio: user.profile?.bio,
+          activityIntent: user.profile?.activityIntent,
+          chatReadiness: user.profile?.chatReadiness || 'browsing_only',
+          trustScore: user.profile?.trustScore || 50,
+          distance: Math.round(distance),
+          interests: userInterests.slice(0, 5),
+          sharedInterests,
+          lastActive: user.profile?.lastActiveAt?.toISOString(),
+          isVerified: (user.profile?.trustLevel === 'verified' || user.profile?.trustLevel === 'vip'),
+        };
+      })
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, limit);
+
+    return c.json({ users: nearbyUsers });
+  } catch (error) {
+    console.error('Error fetching nearby users:', error);
+    return c.json({ error: 'Failed to fetch nearby users' }, 500);
+  }
+});
+
+// GET /api/users/:id - Get user profile
+userRoutes.get('/:id', async (c) => {
+  try {
+    const userId = c.req.header('x-user-id');
+    const targetId = c.req.param('id');
+
+    const user = await prisma.user.findUnique({
+      where: { id: targetId },
+      include: { profile: true },
+    });
+
+    if (!user) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    // Check if blocked
+    if (userId) {
+      const block = await prisma.block.findFirst({
+        where: {
+          OR: [
+            { blockerId: userId, blockedUserId: targetId },
+            { blockerId: targetId, blockedUserId: userId },
+          ],
+        },
+      });
+
+      if (block) {
+        return c.json({ error: 'Unable to view this profile' }, 403);
+      }
+    }
+
+    // Parse interests
+    let interests: string[] = [];
+    if (user.profile?.interests) {
+      try {
+        interests = JSON.parse(user.profile.interests);
+      } catch {}
+    }
+
+    // Parse lookingFor
+    let lookingFor: string[] = [];
+    if (user.profile?.lookingFor) {
+      try {
+        lookingFor = JSON.parse(user.profile.lookingFor);
+      } catch {}
+    }
+
+    // Check if current user follows/has waved at this user
+    let hasWaved = false;
+    let hasReceivedWave = false;
+    if (userId) {
+      const sentWave = await prisma.wave.findUnique({
+        where: { fromUserId_toUserId: { fromUserId: userId, toUserId: targetId } },
+      });
+      hasWaved = !!sentWave;
+
+      const receivedWave = await prisma.wave.findUnique({
+        where: { fromUserId_toUserId: { fromUserId: targetId, toUserId: userId } },
+      });
+      hasReceivedWave = !!receivedWave;
+    }
+
+    return c.json({
+      user: {
+        id: user.id,
+        displayName: user.profile?.displayName || user.name || 'Anonymous',
+        username: user.profile?.handle || user.id.slice(0, 8),
+        avatar: user.profile?.avatar || user.image,
+        bio: user.profile?.bio,
+        age: user.profile?.age,
+        activityIntent: user.profile?.activityIntent,
+        chatReadiness: user.profile?.chatReadiness || 'browsing_only',
+        trustScore: user.profile?.trustScore || 50,
+        trustLevel: user.profile?.trustLevel || 'new',
+        interests,
+        lookingFor,
+        isVerified: (user.profile?.trustLevel === 'verified' || user.profile?.trustLevel === 'vip'),
+        hasWaved,
+        hasReceivedWave,
+        isMutualWave: hasWaved && hasReceivedWave,
+        memberSince: user.createdAt.toISOString(),
+        lastActive: user.profile?.lastActiveAt?.toISOString(),
+        // Stats
+        pinsCreated: user.profile?.pinsCreated || 0,
+        eventsAttended: user.profile?.eventsAttended || 0,
+        minglesAttended: user.profile?.minglesAttended || 0,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching user:', error);
+    return c.json({ error: 'Failed to fetch user' }, 500);
+  }
+});
+
+// POST /api/users/:id/block - Block user
+userRoutes.post('/:id/block', async (c) => {
+  try {
+    const userId = c.req.header('x-user-id');
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const targetId = c.req.param('id');
+
+    if (userId === targetId) {
+      return c.json({ error: 'Cannot block yourself' }, 400);
+    }
+
+    // Check if already blocked
+    const existing = await prisma.block.findUnique({
+      where: { blockerId_blockedUserId: { blockerId: userId, blockedUserId: targetId } },
+    });
+
+    if (existing) {
+      return c.json({ error: 'User already blocked' }, 400);
+    }
+
+    await prisma.block.create({
+      data: {
+        blockerId: userId,
+        blockedUserId: targetId,
+      },
+    });
+
+    // Remove any waves between users
+    await prisma.wave.deleteMany({
+      where: {
+        OR: [
+          { fromUserId: userId, toUserId: targetId },
+          { fromUserId: targetId, toUserId: userId },
+        ],
+      },
+    });
+
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('Error blocking user:', error);
+    return c.json({ error: 'Failed to block user' }, 500);
+  }
+});
+
+// DELETE /api/users/:id/block - Unblock user
+userRoutes.delete('/:id/block', async (c) => {
+  try {
+    const userId = c.req.header('x-user-id');
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const targetId = c.req.param('id');
+
+    await prisma.block.delete({
+      where: { blockerId_blockedUserId: { blockerId: userId, blockedUserId: targetId } },
+    });
+
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('Error unblocking user:', error);
+    return c.json({ error: 'Failed to unblock user' }, 500);
+  }
+});
+
+// PUT /api/users/location - Update current location
+userRoutes.put('/location', async (c) => {
+  try {
+    const userId = c.req.header('x-user-id');
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const { latitude, longitude } = await c.req.json();
+
+    await prisma.profile.update({
+      where: { userId },
+      data: {
+        currentLocationLat: latitude,
+        currentLocationLng: longitude,
+        lastActiveAt: new Date(),
+      },
+    });
+
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('Error updating location:', error);
+    return c.json({ error: 'Failed to update location' }, 500);
+  }
+});
+
+// POST /api/users/:id/wave - Wave at user (convenience endpoint)
+userRoutes.post('/:id/wave', async (c) => {
+  try {
+    const userId = c.req.header('x-user-id');
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const targetId = c.req.param('id');
+
+    if (userId === targetId) {
+      return c.json({ error: 'Cannot wave at yourself' }, 400);
+    }
+
+    // Check if already waved recently
+    const existing = await prisma.wave.findUnique({
+      where: { fromUserId_toUserId: { fromUserId: userId, toUserId: targetId } },
+    });
+
+    if (existing) {
+      const hoursSince = (Date.now() - existing.createdAt.getTime()) / (1000 * 60 * 60);
+      if (hoursSince < 24) {
+        return c.json({ error: 'Already waved recently', waved: true });
+      }
+
+      // Update existing wave
+      await prisma.wave.update({
+        where: { id: existing.id },
+        data: { createdAt: new Date(), status: 'sent', seenAt: null },
+      });
+    } else {
+      await prisma.wave.create({
+        data: { fromUserId: userId, toUserId: targetId },
+      });
+    }
+
+    return c.json({ success: true, waved: true });
+  } catch (error) {
+    console.error('Error waving:', error);
+    return c.json({ error: 'Failed to wave' }, 500);
+  }
+});
+
+// ============================================================================
+// CAMPUS LAYER ENDPOINTS
+// ============================================================================
+
+// GET /api/users/campus/stats - Get campus activity stats
+userRoutes.get('/campus/stats', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    // Get user's school
+    const profile = await prisma.profile.findUnique({
+      where: { userId },
+      select: { primarySchool: true },
+    });
+
+    if (!profile?.primarySchool) {
+      return c.json({ error: 'No school set' }, 400);
+    }
+
+    const school = profile.primarySchool;
+
+    // Count users at same school
+    const usersAtSchool = await prisma.profile.count({
+      where: { primarySchool: school },
+    });
+
+    // Count events at school
+    const eventsAtSchool = await prisma.event.count({
+      where: { schoolAffiliation: school },
+    });
+
+    // Count active users (active in last 7 days)
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const activeUsers = await prisma.profile.count({
+      where: {
+        primarySchool: school,
+        lastActiveAt: { gte: sevenDaysAgo },
+      },
+    });
+
+    return c.json({
+      school,
+      stats: {
+        totalMembers: usersAtSchool,
+        activeMembers: activeUsers,
+        upcomingEvents: eventsAtSchool,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching campus stats:', error);
+    return c.json({ error: 'Failed to fetch campus stats' }, 500);
+  }
+});
+
+// GET /api/users/campus/list - List schools with user counts
+userRoutes.get('/campus/list', async (c) => {
+  try {
+    const limit = parseInt(c.req.query('limit') || '50');
+
+    // Get schools with user counts using raw query
+    const schools = await prisma.$queryRaw`
+      SELECT "primarySchool" as name, COUNT(*) as count
+      FROM "Profile"
+      WHERE "primarySchool" IS NOT NULL AND "primarySchool" != ''
+      GROUP BY "primarySchool"
+      ORDER BY count DESC
+      LIMIT ${limit}
+    ` as { name: string; count: bigint }[];
+
+    return c.json({
+      schools: schools.map(s => ({
+        name: s.name,
+        memberCount: Number(s.count),
+      })),
+    });
+  } catch (error) {
+    console.error('Error listing schools:', error);
+    return c.json({ error: 'Failed to list schools' }, 500);
+  }
+});
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+function calculateDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371000; // Earth's radius in meters
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function toRad(deg: number): number {
+  return deg * (Math.PI / 180);
+}
+
