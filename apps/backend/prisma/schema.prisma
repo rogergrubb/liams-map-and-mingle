@@ -1,0 +1,1251 @@
+// This is your Prisma schema file for Map Mingle
+// Learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// AUTHENTICATION (Better Auth)
+// ============================================================================
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  image         String?
+  emailVerified Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?
+
+  // Stripe subscription fields
+  stripeCustomerId      String?   @unique
+  stripeSubscriptionId  String?   @unique
+  subscriptionTier      String?   @default("free") // free, basic, premium
+  subscriptionStatus    String?   // trialing, active, past_due, canceled, etc.
+  trialEndsAt           DateTime?
+  subscriptionEnd       DateTime?
+  lastActiveAt          DateTime?
+  pushToken             String?
+  phone                 String?
+
+  // Profile fields (for integration compatibility) - Updated for AI features
+  username              String?   @unique
+  displayName           String?
+  bio                   String?
+  interests             String[]  @default([])
+  location              String?
+  activityLevel         String?   // active, moderate, casual
+  isPremium             Boolean   @default(false)
+
+  // Privacy settings
+  profileVisibility     String?   @default("public") // public, friends, private
+  showLocation          Boolean   @default(true)
+  showActivity          Boolean   @default(true)
+  allowMessages         String?   @default("everyone") // everyone, friends, nobody
+  allowTags             Boolean   @default(true)
+  showOnlineStatus      Boolean   @default(true)
+  shareData             Boolean   @default(false)
+
+  // Visibility Spectrum (unified privacy system)
+  visibilityLevel       String?   @default("circles") // ghost, circles, fuzzy, social, discoverable, beacon
+  visibilityUpdatedAt   DateTime?
+  beaconExpiresAt       DateTime? // When beacon mode auto-expires
+  beaconDuration        Int?      @default(60) // Beacon duration in minutes
+  locationPrecision     String?   @default("precise") // precise, approximate
+  allowDiscovery        Boolean   @default(true) // Can be found in searches
+  showToCirclesOnly     Boolean   @default(false) // Legacy compat
+
+
+  // Notification settings
+  notifyMessages        Boolean   @default(true)
+  notifyLikes           Boolean   @default(true)
+  notifyComments        Boolean   @default(true)
+  notifyFollows         Boolean   @default(true)
+  notifyEvents          Boolean   @default(true)
+  notifyProximity       Boolean   @default(true)
+  notifyEmail           Boolean   @default(true)
+  notifyPush            Boolean   @default(true)
+
+  // Security
+  twoFactorEnabled      Boolean   @default(false)
+
+  // Relations
+  profile               Profile?
+  sessions              Session[]
+  accounts              Account[]
+  pins                  Pin[]
+  pinLikes              PinLike[]
+  savedPins             SavedPin[]
+  conversations         ConversationParticipant[]
+  eventsHosted          Event[]               @relation("EventHost")
+  eventAttendees        EventAttendee[]
+  eventComments         EventComment[]
+  forumThreads          ForumThread[]
+  forumPosts            ForumPost[]
+  forumComments         ForumComment[]
+  minglesHosted         MingleEvent[]         @relation("MingleHost")
+  mingleParticipants    MingleParticipant[]
+  videoCallsInitiated   VideoCall[]           @relation("Caller")
+  videoCallsReceived    VideoCall[]           @relation("Receiver")
+  videoRoomsHosted      VideoRoom[]           @relation("RoomHost")
+  roomParticipants      RoomParticipant[]
+  streaks               UserStreak[]
+  dailyActivities       DailyActivity[]
+  blocksInitiated       Block[]               @relation("BlockInitiator")
+  blocksReceived        Block[]               @relation("BlockTarget")
+  reportsInitiated      Report[]              @relation("ReportInitiator")
+  reportsReceived       Report[]              @relation("ReportTarget")
+  connectionsSent       Connection[]          @relation("ConnectionRequester")
+  connectionsReceived   Connection[]          @relation("ConnectionAddressee")
+  proximityAlerts       ProximityAlert[]
+  proximityAlertMatches ProximityAlertMatch[]
+  hotspotActivities     HotspotActivity[]
+  uploads               Upload[]
+  usageMetrics          UsageMetrics?
+  rateLimitLogs         RateLimitLog[]
+  wavesSent             Wave[]               @relation("WaveSender")
+  wavesReceived         Wave[]               @relation("WaveReceiver")
+  phoneNumber        String?
+  
+  sentMessages      Message[]    @relation("MessageSender")
+  receivedMessages  Message[]    @relation("MessageReceiver")
+  callsInitiated    Call[]       @relation("CallInitiator")
+  callsReceived     Call[]       @relation("CallRecipient")
+  notificationsFor  Notification[] @relation("Notifications")
+  notificationsFrom Notification[] @relation("NotificationsFrom")
+  blockedUsers      BlockedUser[] @relation("BlockedBy")
+  blockingUsers     BlockedUser[] @relation("Blocks")
+  photos            UserPhoto[]   @relation("UserPhotos")
+  
+  // Safety features
+  circlesOwned      Circle[]         @relation("CircleOwner")
+  circleMemberships CircleMember[]
+  trips             Trip[]           @relation("UserTrips")
+  checkIns          CheckIn[]        @relation("UserCheckIns")
+  emergencyAlerts   EmergencyAlert[] @relation("UserEmergencies")
+  emergencyContacts EmergencyContact[] @relation("UserEmergencyContacts")
+  linkedAsEmergencyContact EmergencyContact[] @relation("LinkedEmergencyContact")
+  createdArrivalAlerts  ArrivalAlert[]   @relation("CreatedArrivalAlerts")
+  watchedByAlerts       ArrivalAlert[]   @relation("WatchedArrivalAlerts")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  sessionToken String @unique
+  userId    String
+  expires   DateTime
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  accountId         String
+  providerId        String
+  accessToken       String?
+  refreshToken      String?
+  accessTokenExpiresAt DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope             String?
+  idToken           String?
+  password          String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, accountId])
+  
+}
+
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([identifier, value])
+}
+
+// ============================================================================
+// USER PROFILE
+// ============================================================================
+
+model Profile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Basic Info
+  handle      String?  @unique
+  displayName String?
+  bio         String?  @db.VarChar(300)
+  avatar      String?
+
+  // Demographics
+  age                Int?
+  gender             String?  // male, female, nonbinary, prefer_not
+  relationshipStatus String?  // single, dating, committed, married, open, complicated, prefer_not
+  openness           String?  // monogamous, open, flexible, exploring, prefer_not
+
+  // Interests & Preferences
+  interests            String?  @db.Text // JSON array
+  lookingFor           String?
+  chatReadiness        String?  @default("browsing_only") // open_to_chat, open_to_meet, browsing_only, busy
+  activityIntent       String?
+  activityIntentActive Boolean  @default(false)
+  activityIntentSetAt  DateTime?
+
+  // Current Location
+  currentLocationLat Float?
+  currentLocationLng Float?
+
+  // Matching Preferences
+  preferredAgeMin    Int?     @default(18)
+  preferredAgeMax    Int?     @default(99)
+  preferredDistanceKm Int?    @default(50)
+  maxDistance        Int?     @default(50)
+  minAge             Int?
+  maxAge             Int?
+
+  // Privacy Settings
+  visibilityMode     String   @default("public") // public, friends_only, hidden
+  whoCanMessage      String   @default("everyone") // everyone, verified, none
+  whoCanSeePins      String   @default("everyone") // everyone, connections, none
+  whoCanSeeProfile   String   @default("everyone") // everyone, connections, none
+  showActivityStatus Boolean  @default(true)
+  hideLastOnline     Boolean  @default(false)
+
+  // Premium Privacy Features
+  ghostMode        Boolean @default(false)
+  incognitoMode    Boolean @default(false)
+  showAvailability Boolean @default(true)
+
+  // Per-field Privacy Controls (hide specific info from profile)
+  hideBio        Boolean @default(false)
+  hideAge        Boolean @default(false)
+  hideInterests  Boolean @default(false)
+  hideLookingFor Boolean @default(false)
+  hideOccupation Boolean @default(false)
+  hideEducation  Boolean @default(false)
+  hideLocation   Boolean @default(false)
+  hideLanguages  Boolean @default(false)
+
+  // Extended Profile Info
+  occupation String?
+  education  String?
+  location   String?
+  languages  String? // JSON array
+
+  // Campus Layer - School Affiliation
+  primarySchool   String?   // School name
+  schoolRole      String?   // student, faculty, staff, alum, parent
+  gradYear        Int?      // Graduation year for students/alumni
+  schoolVerified  Boolean   @default(false) // True if verified via .edu email
+
+  // Selective Visibility (Smart Invisibility)
+  selectiveVisibilityEnabled Boolean @default(false)
+  visibilityMinAge           Int?
+  visibilityMaxAge           Int?
+  visibilityRequireInterests Boolean @default(false)
+  visibilityMinSharedInterests Int?
+  visibilityMaxDistance      Int?
+  visibilityMinReputation    Int?
+  visibilityPremiumOnly      Boolean @default(false)
+  visibilityHideFromBlocked  Boolean @default(true)
+
+  // Trust & Reputation
+  trustScore           Int     @default(50)
+  trustLevel           String  @default("new") // new, trusted, verified, vip, flagged, restricted
+  positiveInteractions Int     @default(0)
+  negativeInteractions Int     @default(0)
+  spamReports          Int     @default(0)
+  behaviorFlags        Int     @default(0)
+  pinsCreated          Int     @default(0)
+  likesReceived        Int     @default(0)
+  messagesSent         Int     @default(0)
+  messagesReceived     Int     @default(0)
+  eventsAttended       Int     @default(0)
+  minglesAttended      Int     @default(0)
+
+  // Subscription
+  subscriptionStatus    String    @default("trial") // trial, active, expired, canceled
+  subscriptionStartedAt DateTime  @default(now())
+  subscriptionExpiresAt DateTime?
+  stripeCustomerId      String?
+  stripeSubscriptionId  String?
+
+  // Boost & Premium Features
+  boostActive        Boolean  @default(false)
+  boostExpiresAt     DateTime?
+  featuredBadgeColor String   @default("none") // gold, blue, purple, none
+
+  // Activity Tracking
+  lastActiveAt DateTime?
+  lastSeenAt   DateTime?
+
+  // Onboarding
+  onboardingComplete Boolean @default(false)
+  onboardingStep     String? // Current step if not complete
+
+  // Referrals
+  referralCode String? @unique // User's unique invite code
+  referredBy   String? // referralCode of user who invited them
+
+  // Pin Alert Notification Settings
+  notifyFriendPins     Boolean @default(true)  // Get notified when friends drop pins
+  notifyNearbyPins     Boolean @default(false) // Get notified when anyone nearby drops pins
+  nearbyRadiusKm       Float   @default(5.0)   // Radius for "nearby" notifications (km)
+  notifyViaEmail       Boolean @default(true)  // Send email notifications
+  notifyViaSms         Boolean @default(false) // Send SMS notifications
+  notifyViaInApp       Boolean @default(true)  // In-app notifications
+  phoneNumber          String?                 // Phone number for SMS (E.164 format)
+  phoneVerified        Boolean @default(false) // Is phone number verified
+  notificationDigest   String  @default("instant") // instant, hourly, daily
+  quietHoursStart      String? // e.g., "22:00"
+  quietHoursEnd        String? // e.g., "08:00"
+  quietHoursTimezone   String? // e.g., "America/Los_Angeles"
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ============================================================================
+// SAFETY - EMERGENCY CONTACTS
+// ============================================================================
+
+model EmergencyContact {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation("UserEmergencyContacts", fields: [userId], references: [id], onDelete: Cascade)
+  
+  name        String   @db.VarChar(100)
+  phone       String?  @db.VarChar(20)
+  email       String?  @db.VarChar(255)
+  relationship String? @db.VarChar(50)
+  
+  notifyViaCall   Boolean @default(true)
+  notifyViaSms    Boolean @default(true)
+  notifyViaApp    Boolean @default(false)
+  notifyViaEmail  Boolean @default(true)
+  
+  linkedUserId String?
+  linkedUser   User?   @relation("LinkedEmergencyContact", fields: [linkedUserId], references: [id], onDelete: SetNull)
+  
+  priority    Int      @default(1)
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@index([userId])
+  @@index([linkedUserId])
+}
+
+// ============================================================================
+// SAFETY - CIRCLES (Family Groups)
+// ============================================================================
+
+model Circle {
+  id          String   @id @default(cuid())
+  name        String   @db.VarChar(50) // "Family", "Close Friends", "Carpool", etc.
+  ownerId     String
+  emoji       String?  @default("👨‍👩‍👧‍👦")
+  color       String?  @default("#3B82F6")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  owner       User     @relation("CircleOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  members     CircleMember[]
+  trips       Trip[]
+  arrivalAlerts ArrivalAlert[]
+
+  @@index([ownerId])
+}
+
+model CircleMember {
+  id          String   @id @default(cuid())
+  circleId    String
+  userId      String
+  role        String   @default("member") // owner, admin, member
+  canSeeLocation Boolean @default(true)
+  canRequestLocation Boolean @default(true)
+  joinedAt    DateTime @default(now())
+
+  circle      Circle   @relation(fields: [circleId], references: [id], onDelete: Cascade)
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([circleId, userId])
+  @@index([userId])
+}
+
+// ============================================================================
+// SAFETY - TRIPS (Location Sharing Sessions)
+// ============================================================================
+
+model Trip {
+  id              String    @id @default(cuid())
+  userId          String
+  circleId        String?   // Optional - share with specific circle or all connections
+  name            String?   @db.VarChar(100) // "Driving home", "Walking to school"
+  
+  // Origin
+  originLat       Float
+  originLng       Float
+  originName      String?   @db.VarChar(200)
+  
+  // Destination
+  destLat         Float
+  destLng         Float
+  destName        String?   @db.VarChar(200)
+  
+  // Status
+  status          String    @default("active") // active, paused, arrived, cancelled
+  startedAt       DateTime  @default(now())
+  arrivedAt       DateTime?
+  expectedArrival DateTime?
+  
+  // Live tracking
+  currentLat      Float?
+  currentLng      Float?
+  lastUpdatedAt   DateTime?
+  updateInterval  Int       @default(60) // seconds between updates (30 or 60)
+  
+  // Battery (optional)
+  batteryLevel    Int?      // 0-100
+  batterySharing  Boolean   @default(false)
+  
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user            User      @relation("UserTrips", fields: [userId], references: [id], onDelete: Cascade)
+  circle          Circle?   @relation(fields: [circleId], references: [id], onDelete: SetNull)
+  arrivalAlerts   ArrivalAlert[]
+
+  @@index([userId])
+  @@index([circleId])
+  @@index([status])
+}
+
+// ============================================================================
+// SAFETY - ARRIVAL ALERTS
+// ============================================================================
+
+model ArrivalAlert {
+  id              String    @id @default(cuid())
+  creatorId       String    // Who created the alert
+  watchedUserId   String    // Who we're watching
+  tripId          String?   // Optional - linked to specific trip
+  circleId        String?   // Optional - for circle-based alerts
+  
+  // Location to watch for
+  destLat         Float
+  destLng         Float
+  destName        String?   @db.VarChar(200)
+  radiusMeters    Int       @default(100) // How close = "arrived"
+  
+  // Alert timing
+  expectedBy      DateTime? // "Alert me if not arrived by..."
+  notifyOnArrival Boolean   @default(true)
+  notifyIfLate    Boolean   @default(true)
+  lateThresholdMin Int      @default(15) // Minutes past expected time
+  
+  // Status
+  status          String    @default("active") // active, triggered, expired, cancelled
+  triggeredAt     DateTime?
+  
+  createdAt       DateTime  @default(now())
+  expiresAt       DateTime? // Auto-delete after this time
+
+  creator         User      @relation("CreatedArrivalAlerts", fields: [creatorId], references: [id], onDelete: Cascade)
+  watchedUser     User      @relation("WatchedArrivalAlerts", fields: [watchedUserId], references: [id], onDelete: Cascade)
+  trip            Trip?     @relation(fields: [tripId], references: [id], onDelete: SetNull)
+  circle          Circle?   @relation(fields: [circleId], references: [id], onDelete: SetNull)
+
+  @@index([creatorId])
+  @@index([watchedUserId])
+  @@index([status])
+}
+
+// ============================================================================
+// SAFETY - CHECK-INS
+// ============================================================================
+
+model CheckIn {
+  id          String    @id @default(cuid())
+  userId      String
+  type        String    // "home", "arrived", "safe", "custom"
+  message     String?   @db.VarChar(200)
+  latitude    Float?
+  longitude   Float?
+  placeName   String?   @db.VarChar(200)
+  circleId    String?   // Share with specific circle or all connections
+  createdAt   DateTime  @default(now())
+
+  user        User      @relation("UserCheckIns", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// SAFETY - EMERGENCY ALERTS (Panic Button)
+// ============================================================================
+
+model EmergencyAlert {
+  id               String    @id @default(cuid())
+  userId           String
+  latitude         Float
+  longitude        Float
+  locationName     String?   // Reverse geocoded location name
+  batteryLevel     Int?
+  message          String?   @db.VarChar(500)
+  voiceNoteUrl     String?   // S3 URL for recorded message
+  alertType        String    @default("manual") // manual, fall_detected, sos_held, inactivity, test
+  status           String    @default("active") // active, acknowledged, resolved, false_alarm
+  resolvedAt       DateTime?
+  resolvedBy       String?   // User who marked it resolved
+  notificationsSent Json?    // Array of {contactId, method, sentAt, status}
+  createdAt        DateTime  @default(now())
+
+  user        User      @relation("UserEmergencies", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// PINS (MISSED CONNECTIONS)
+// ============================================================================
+
+model Pin {
+  id          String   @id @default(cuid())
+  userId      String
+  latitude    Float
+  longitude   Float
+  description String   @db.VarChar(500)
+  image       String?
+  likesCount  Int      @default(0)
+  arrivalTime DateTime? // When user will arrive at this location (for "Where I'll Be" pins)
+  pinType     String   @default("current") // "current" or "future"
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  likes     PinLike[]
+  savedBy   SavedPin[]
+
+  @@index([latitude, longitude])
+  @@index([createdAt])
+  @@index([arrivalTime])
+}
+
+model PinLike {
+  id        String   @id @default(cuid())
+  pinId     String
+  userId    String
+  createdAt DateTime @default(now())
+
+  pin  Pin  @relation(fields: [pinId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([pinId, userId])
+}
+
+model SavedPin {
+  id        String   @id @default(cuid())
+  userId    String
+  pinId     String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pin  Pin  @relation(fields: [pinId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, pinId])
+}
+
+// ============================================================================
+// MESSAGING
+// ============================================================================
+
+model Conversation {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  participants ConversationParticipant[]
+}
+
+model ConversationParticipant {
+  id             String   @id @default(cuid())
+  conversationId String
+  userId         String
+  joinedAt       DateTime @default(now())
+  lastReadAt     DateTime?
+  isMuted        Boolean  @default(false)
+  isArchived     Boolean  @default(false)
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, userId])
+}
+
+
+// ============================================================================
+// EVENTS
+// ============================================================================
+
+model Event {
+  id           String    @id @default(cuid())
+  hostId       String
+  title        String    @db.VarChar(100)
+  description  String?   @db.Text
+  categories   String[]  @default(["social"]) // Can belong to multiple categories: social, dating, networking, activity, other
+  image        String?
+  venueName    String
+  venueAddress String?
+  latitude     Float
+  longitude    Float
+  startTime    DateTime
+  endTime      DateTime?
+  maxAttendees Int?
+  schoolAffiliation String?  // Campus events can be filtered by school
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  host      User            @relation("EventHost", fields: [hostId], references: [id], onDelete: Cascade)
+  attendees EventAttendee[]
+  comments  EventComment[]
+
+  @@index([latitude, longitude])
+  @@index([startTime])
+}
+
+model EventComment {
+  id        String   @id @default(cuid())
+  eventId   String
+  userId    String
+  text      String   @db.Text
+  createdAt DateTime @default(now())
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([eventId, createdAt])
+}
+
+model EventAttendee {
+  id        String   @id @default(cuid())
+  eventId   String
+  userId    String
+  status    String   @default("going") // going, maybe, not_going
+  createdAt DateTime @default(now())
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, userId])
+}
+
+// ============================================================================
+// FORUMS (COMMUNITY)
+// ============================================================================
+
+model ForumThread {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String   @db.VarChar(200)
+  venueName String?
+  venueType String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user  User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  posts ForumPost[]
+}
+
+model ForumPost {
+  id          String   @id @default(cuid())
+  authorId    String
+  title       String   @db.VarChar(200)
+  content     String   @db.Text
+  category    String   @default("general") // general, meetups, events, places, tips, questions
+  isPinned    Boolean  @default(false)
+  likesCount  Int      @default(0)
+  
+  // Optional location
+  locationName String?
+  latitude     Float?
+  longitude    Float?
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  author   User           @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments ForumComment[]
+  likes    ForumPostLike[]
+  
+  // Legacy - keep for migration
+  threadId String?
+  thread   ForumThread?   @relation(fields: [threadId], references: [id], onDelete: SetNull)
+
+  @@index([category])
+  @@index([createdAt])
+  @@index([likesCount])
+}
+
+model ForumComment {
+  id         String   @id @default(cuid())
+  postId     String
+  authorId   String
+  content    String   @db.VarChar(1000)
+  parentId   String?  // For nested replies
+  likesCount Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  post   ForumPost       @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author User            @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  parent ForumComment?   @relation("CommentReplies", fields: [parentId], references: [id], onDelete: SetNull)
+  replies ForumComment[] @relation("CommentReplies")
+  likes  ForumCommentLike[]
+}
+
+model ForumPostLike {
+  id        String   @id @default(cuid())
+  postId    String
+  userId    String
+  createdAt DateTime @default(now())
+
+  post ForumPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@unique([postId, userId])
+}
+
+model ForumCommentLike {
+  id        String   @id @default(cuid())
+  commentId String
+  userId    String
+  createdAt DateTime @default(now())
+
+  comment ForumComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@unique([commentId, userId])
+}
+
+// ============================================================================
+// MINGLES (PLANNED MEETUPS)
+// ============================================================================
+
+model MingleEvent {
+  id              String    @id @default(cuid())
+  hostId          String
+  title           String    @db.VarChar(100)
+  description     String?   @db.VarChar(500)
+  intentCard      String?
+  latitude        Float
+  longitude       Float
+  locationName    String?
+  radius          Int       @default(200) // meters
+  startTime       DateTime
+  duration        Int       @default(30) // minutes
+  endTime         DateTime
+  status          String    @default("live") // scheduled, live, ended, cancelled
+  maxParticipants Int?
+  isRecurring     Boolean   @default(false)
+  isPremiumOnly   Boolean   @default(false)
+  viewCount       Int       @default(0)
+  
+  // NEW FIELDS FOR READY TO MINGLE FEATURE
+  isDraft         Boolean   @default(true)
+  isActive        Boolean   @default(true)
+  privacy         String    @default("public") // public, friends, private
+  tags            String[]  @default([])
+  photoUrl        String?
+  adminNotes      String?
+  
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  host         User                @relation("MingleHost", fields: [hostId], references: [id], onDelete: Cascade)
+  participants MingleParticipant[]
+  views        MingleView[]
+
+  @@index([latitude, longitude])
+  @@index([startTime])
+  @@index([hostId])
+  @@index([isDraft])
+  @@index([isActive])
+}
+
+model MingleParticipant {
+  id           String    @id @default(cuid())
+  mingleId     String
+  userId       String
+  status       String    @default("interested") // interested, confirmed, declined
+  joinedAt     DateTime  @default(now())
+  notifiedAt   DateTime?
+
+  mingle MingleEvent @relation(fields: [mingleId], references: [id], onDelete: Cascade)
+  user   User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([mingleId, userId])
+}
+
+model MingleView {
+  id        String   @id @default(cuid())
+  mingleId  String
+visitorId String?  // null for anonymous
+  viewedAt  DateTime @default(now())
+
+  mingle MingleEvent @relation(fields: [mingleId], references: [id], onDelete: Cascade)
+}
+
+// ============================================================================
+// VIDEO CALLS (1-on-1)
+// ============================================================================
+
+model VideoCall {
+  id         String    @id @default(cuid())
+  callerId   String
+  receiverId String
+  status     String    @default("pending") // pending, active, ended, missed, declined
+  startedAt  DateTime?
+  endedAt    DateTime?
+  duration   Int?      // seconds
+  createdAt  DateTime  @default(now())
+
+  caller   User @relation("Caller", fields: [callerId], references: [id], onDelete: Cascade)
+  receiver User @relation("Receiver", fields: [receiverId], references: [id], onDelete: Cascade)
+}
+
+// ============================================================================
+// VIDEO ROOMS (GROUP CALLS)
+// ============================================================================
+
+model VideoRoom {
+  id              String   @id @default(cuid())
+  hostId          String
+  title           String   @db.VarChar(100)
+  description     String?  @db.VarChar(500)
+  status          String   @default("waiting") // waiting, active, ended
+  maxParticipants Int      @default(10)
+  isPremiumOnly   Boolean  @default(false)
+  latitude        Float?
+  longitude       Float?
+  createdAt       DateTime @default(now())
+  endedAt         DateTime?
+
+  host         User              @relation("RoomHost", fields: [hostId], references: [id], onDelete: Cascade)
+  participants RoomParticipant[]
+}
+
+model RoomParticipant {
+  id        String    @id @default(cuid())
+  roomId    String
+  userId    String
+  joinedAt  DateTime  @default(now())
+  leftAt    DateTime?
+  isPriority Boolean  @default(false)
+
+  room VideoRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([roomId, userId])
+}
+
+// ============================================================================
+// STREAKS & GAMIFICATION
+// ============================================================================
+
+model UserStreak {
+  id               String    @id @default(cuid())
+  userId           String
+  streakType       String    // login, social, explorer, event
+  currentStreak    Int       @default(0)
+  longestStreak    Int       @default(0)
+  lastActivityDate DateTime?
+  totalActivities  Int       @default(0)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, streakType])
+}
+
+model DailyActivity {
+  id           String   @id @default(cuid())
+  userId       String
+  activityType String   // login, message, pin, event, mingle
+  activityDate DateTime @db.Date
+  count        Int      @default(1)
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, activityType, activityDate])
+}
+
+// ============================================================================
+// SAFETY & MODERATION
+// ============================================================================
+
+model Block {
+  id            String   @id @default(cuid())
+  blockerId     String
+  blockedUserId String
+  reason        String?
+  createdAt     DateTime @default(now())
+
+  blocker     User @relation("BlockInitiator", fields: [blockerId], references: [id], onDelete: Cascade)
+  blockedUser User @relation("BlockTarget", fields: [blockedUserId], references: [id], onDelete: Cascade)
+
+  @@unique([blockerId, blockedUserId])
+}
+
+model Report {
+  id              String   @id @default(cuid())
+  type            String   @default("user_report") // user_report, mingle_published, mingle_draft_created, event_created, etc.
+  reporterId      String?  // User who reported (optional for system tracking)
+  reportedUserId  String?  // User being reported (optional for system tracking)
+  initiatorId     String?  // For tracking system-generated records
+  targetId        String?  // ID of the thing being tracked (mingle, event, etc.)
+  reason          String   // spam, harassment, inappropriate, fake, other, or reason for tracking
+  description     String?  @db.VarChar(500)
+  status          String   @default("pending") // pending, reviewed, resolved, dismissed, open
+  eventId         String?  // Optional: if report is related to an event
+  eventCommentId  String?  // Optional: if reporting a specific comment
+  adminNotes      String?  @db.Text
+  createdAt       DateTime @default(now())
+  reviewedAt      DateTime?
+
+  reporter     User? @relation("ReportInitiator", fields: [reporterId], references: [id], onDelete: SetNull)
+  reportedUser User? @relation("ReportTarget", fields: [reportedUserId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([type])
+}
+// ============================================================================
+// HOTSPOTS (ACTIVITY AGGREGATION)
+// ============================================================================
+
+model Hotspot {
+  id            String   @id @default(cuid())
+  geohash       String   @unique
+  centerLat     Float
+  centerLng     Float
+  activeUsers   Int      @default(0)
+  totalActivity Int      @default(0)
+  trendScore    Float    @default(0)
+  peakHour      Int?
+  lastUpdated   DateTime @default(now())
+
+  activities HotspotActivity[]
+
+  @@index([geohash])
+  @@index([trendScore])
+}
+
+model HotspotActivity {
+  id         String   @id @default(cuid())
+  hotspotId  String
+  userId     String?  // null for anonymized
+  activityType String // pin, mingle, event
+  createdAt  DateTime @default(now())
+
+  hotspot Hotspot @relation(fields: [hotspotId], references: [id], onDelete: Cascade)
+  user    User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+}
+
+// ============================================================================
+// PROXIMITY ALERTS
+// ============================================================================
+
+model ProximityAlert {
+  id             String    @id @default(cuid())
+  userId         String
+  name           String    @db.VarChar(50)
+  latitude       Float
+  longitude      Float
+  radiusMeters   Int       @default(1000)
+  isActive       Boolean   @default(true)
+
+  // Criteria
+  minAge         Int?
+  maxAge         Int?
+  gender         String?
+  interests      String?   @db.Text // JSON array
+  activityIntent String?
+  minTrustScore  Int?
+
+  // Limits
+  cooldownMinutes Int      @default(60)
+  maxAlertsPerDay Int      @default(10)
+  alertsToday     Int      @default(0)
+  lastTriggeredAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  matches ProximityAlertMatch[]
+}
+
+model ProximityAlertMatch {
+  id           String   @id @default(cuid())
+  alertId      String
+  matchedUserId String
+  distance     Float
+  matchedAt    DateTime @default(now())
+  notified     Boolean  @default(false)
+
+  alert       ProximityAlert @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  matchedUser User           @relation(fields: [matchedUserId], references: [id], onDelete: Cascade)
+
+  @@unique([alertId, matchedUserId])
+}
+
+// ============================================================================
+// NOTIFICATIONS
+// ============================================================================
+
+model PushToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  platform  String   // ios, android
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model NotificationSettings {
+  id              String  @id @default(cuid())
+  userId          String  @unique
+  messages        Boolean @default(true)
+  waves           Boolean @default(true)
+  nearbyUsers     Boolean @default(true)
+  events          Boolean @default(true)
+  mingles         Boolean @default(true)
+  pinActivity     Boolean @default(true)
+  forumReplies    Boolean @default(true)
+  streakReminders Boolean @default(true)
+  marketing       Boolean @default(false)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+
+// ============================================================================
+// UPLOADS
+// ============================================================================
+
+model Upload {
+  id          String   @id @default(cuid())
+  userId      String
+  key         String   @unique
+  url         String
+  filename    String
+  contentType String
+  size        Int
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ============================================================================
+// WAVES (POKES)
+// ============================================================================
+
+model Wave {
+  id         String   @id @default(cuid())
+  fromUserId String
+  toUserId   String
+  message    String?  @db.VarChar(100)
+  status     String   @default("sent") // sent, seen, waved_back
+  createdAt  DateTime @default(now())
+  seenAt     DateTime?
+
+  fromUser User @relation("WaveSender", fields: [fromUserId], references: [id], onDelete: Cascade)
+  toUser   User @relation("WaveReceiver", fields: [toUserId], references: [id], onDelete: Cascade)
+
+  @@unique([fromUserId, toUserId])
+  @@index([toUserId])
+}
+
+// ============================================================================
+// TRIAL & USAGE TRACKING
+// ============================================================================
+
+model UsageMetrics {
+  id                  String   @id @default(cuid())
+  userId              String   @unique
+  pinsToday           Int      @default(0)
+  pinsThisMonth       Int      @default(0)
+  minglestoday        Int      @default(0)
+  minglesThisMonth    Int      @default(0)
+  messagesToday       Int      @default(0)
+  messagesThisMonth   Int      @default(0)
+  lastDailyReset      DateTime @default(now())
+  lastMonthlyReset    DateTime @default(now())
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model RateLimitLog {
+  id        String   @id @default(cuid())
+  userId    String
+  endpoint  String
+  method    String
+  timestamp DateTime @default(now())
+  blocked   Boolean  @default(false)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([timestamp])
+}
+
+// Video Call History
+
+// User Blocking
+
+// ===== MESSAGING SYSTEM =====
+
+model Message {
+  id        String   @id @default(cuid())
+  senderId  String
+  sender    User     @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+  
+  receiverId String
+  receiver  User     @relation("MessageReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+  
+  content   String
+  type      String   @default("text") // text, image, audio, video
+  imageUrl  String?  // S3 URL for image messages
+  isRead    Boolean  @default(false)
+  readAt    DateTime?
+  editedAt  DateTime?
+  createdAt DateTime @default(now())
+  
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([createdAt])
+}
+
+model Call {
+  id            String   @id @default(cuid())
+  initiatorId   String
+  initiator     User     @relation("CallInitiator", fields: [initiatorId], references: [id], onDelete: Cascade)
+  
+  recipientId   String
+  recipient     User     @relation("CallRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+  
+  startTime     DateTime @default(now())
+  endTime       DateTime?
+  duration      Int?
+  status        String   @default("pending")
+  createdAt     DateTime @default(now())
+  
+  @@index([initiatorId])
+  @@index([recipientId])
+  @@index([createdAt])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation("Notifications", fields: [userId], references: [id], onDelete: Cascade)
+  
+  type      String
+  title     String
+  body      String
+  fromUserId String?
+  fromUser   User?    @relation("NotificationsFrom", fields: [fromUserId], references: [id], onDelete: SetNull)
+  
+  isRead    Boolean  @default(false)
+  readAt    DateTime?
+  data      String?
+  createdAt DateTime @default(now())
+  
+  @@index([userId])
+  @@index([isRead])
+  @@index([createdAt])
+}
+
+model BlockedUser {
+  id        String   @id @default(cuid())
+  blockerId String
+  blocker   User     @relation("BlockedBy", fields: [blockerId], references: [id], onDelete: Cascade)
+  
+  blockedId String
+  blocked   User     @relation("Blocks", fields: [blockedId], references: [id], onDelete: Cascade)
+  
+  reason    String?
+  createdAt DateTime @default(now())
+  
+  @@unique([blockerId, blockedId])
+  @@index([blockerId])
+  @@index([blockedId])
+}
+
+// Connection between users (friendships)
+model Connection {
+  id          String   @id @default(cuid())
+  requesterId String   // User who sent the request
+  addresseeId String   // User who received the request
+  status      String   @default("pending") // pending, accepted, blocked
+  metAt       String?  // Where they met: "event:123", "pin:456", "map"
+  metLocation String?  // Human readable location name
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  requester   User     @relation("ConnectionRequester", fields: [requesterId], references: [id])
+  addressee   User     @relation("ConnectionAddressee", fields: [addresseeId], references: [id])
+
+  @@unique([requesterId, addresseeId])
+  @@index([requesterId])
+  @@index([addresseeId])
+  @@index([status])
+}
+
+// User Photo Gallery (up to 25 photos per user)
+model UserPhoto {
+  id          String   @id @default(cuid())
+  userId      String
+  url         String   // S3 URL
+  caption     String?
+  order       Int      @default(0) // For ordering photos in gallery
+  isProfilePic Boolean @default(false) // If true, this is the main profile picture
+  width       Int?
+  height      Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation("UserPhotos", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, order])
+}
