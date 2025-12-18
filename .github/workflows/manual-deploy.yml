@@ -1,0 +1,73 @@
+name: Manual Backend Deploy
+
+on:
+  repository_dispatch:
+    types: [deploy-backend]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for deployment'
+        required: false
+        default: 'Manual trigger'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run Prisma DB Push
+        run: |
+          cd apps/backend
+          npm install prisma --save-dev
+          npx prisma db push --accept-data-loss --skip-generate
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Google Auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Create Artifact Registry repo if needed
+        run: |
+          gcloud artifacts repositories create cloud-run-source-deploy \
+            --repository-format=docker \
+            --location=us-west1 \
+            --description="Cloud Run source deployments" \
+            --quiet || echo "Repository already exists or creation skipped"
+
+      - name: Deploy to Cloud Run
+        run: |
+          echo "🚀 Deploying backend..."
+          echo "Reason: ${{ github.event.inputs.reason || github.event.client_payload.reason || 'API trigger' }}"
+          
+          cd apps/backend
+          
+          # Deploy with required env vars
+          gcloud run deploy mapandmingle-api \
+            --source . \
+            --region us-west1 \
+            --platform managed \
+            --allow-unauthenticated \
+            --memory 512Mi \
+            --timeout 300 \
+            --port 8080 \
+            --set-env-vars="NODE_ENV=production,DATABASE_URL=${{ secrets.DATABASE_URL }},JWT_SECRET=${{ secrets.JWT_SECRET }},RESEND_API_KEY=${{ secrets.RESEND_API_KEY }},GOOGLE_CLIENT_ID=${{ secrets.GOOGLE_CLIENT_ID }},GOOGLE_CLIENT_SECRET=${{ secrets.GOOGLE_CLIENT_SECRET }},GOOGLE_REDIRECT_URI=https://mapandmingle-api-492171901610.us-west1.run.app/api/auth/google/callback,FRONTEND_URL=https://www.mapandmingle.com"
+          
+      - name: Deployment Complete
+        run: |
+          echo "✅ Backend deployed to Cloud Run!"
+          echo "API URL: https://mapandmingle-api-492171901610.us-west1.run.app"
